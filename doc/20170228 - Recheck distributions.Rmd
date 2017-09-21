@@ -1,0 +1,64 @@
+---
+title: "20170228 - New Samples Distributions"
+output: html_notebook
+---
+
+Fixed (I hope) order-of-magnitude problem on Incentive, Burnout, and Lockin.
+
+Did it work?
+
+```{r}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("data/samples.csv") %>% 
+                rename(pool_number=X1, as_of_date=X2)
+sample_data
+```
+
+How do they look now?
+
+```{r}
+sample_data %>% select(lockin, burnout, incentive) %>%
+  gather(p_factor,value) %>%
+  ggplot(aes(x=value)) + facet_wrap(~p_factor, ncol=1, scales="free") +
+  geom_histogram(bins=50)
+```
+
+burnout looks a bit weird.
+
+Let's check scales.
+
+```{r}
+scaled_data <- sample_data %>% mutate(burnout = burnout * 1e-6, 
+                                      cato = cato * 0.1, 
+                                      next_month_cpr = next_month_cpr,
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 1, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+
+scaled_data %>% 
+  gather(p_factor, value, -pool_number, -as_of_date, -seasonality) %>%
+  ggplot(aes(x=value,group=p_factor)) + facet_wrap(~p_factor, ncol=2) +
+    geom_histogram(bins=50)# + xlim(-0.5,0.5)
+```
+
+What are the ranges?
+```{r}
+scaled_data %>% na.omit %>%
+  gather(p_factor, value, -pool_number, -as_of_date, -seasonality) %>%
+  group_by(p_factor) %>% summarise(min=min(value), 
+                                   low=quantile(value, 0.025),
+                                   mid=median(value),
+                                   high=quantile(value,0.975),
+                                   max=max(value)) %>%
+  gather(thing,value,-p_factor) %>%
+  ggplot(aes(x=p_factor,y=value)) + geom_point(shape="_",size=6)
+```
+CPR screwed up again?

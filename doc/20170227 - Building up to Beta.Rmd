@@ -1,0 +1,204 @@
+---
+title: "20170227 - Build up to Beta Regression"
+output: html_notebook
+---
+
+Since the full model doesn't work, let's start small and build up. Does just intercept + incentive have any merit as a model?
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("data/samples.csv") %>% 
+                rename(pool_number=X1, as_of_date=X2)
+#Scale it
+sample_data <- sample_data %>% mutate(burnout = burnout * 1e-6, 
+                                      cato = cato * 0.1, 
+                                      next_month_cpr = next_month_cpr * 1e-2,
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 1, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+#filter out negative CPRs
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+
+# Transform cpr from [0,1] to (0,1)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% 
+  mutate(next_month_cpr2 = (next_month_cpr*(N-1) + 0.5)/N)
+
+stan_code = "functions {
+    real cpr_pred_abbrev_rng(real lambda, real phi) {
+        real cpr_pred;
+        cpr_pred = beta_rng(lambda * phi, lambda * (1-phi));
+        return cpr_pred;
+    }
+    real cpr_pred_rng(real[] shrunk_season, real beta, real lambda,
+                    int month, real incentive) {
+        real cpr_pred;
+        real phi; #mu
+        phi = inv_logit(shrunk_season[month] + beta * incentive);
+        return cpr_pred_abbrev_rng(lambda, phi);
+        }
+}
+data {
+    int N; #number of records
+
+    real<lower=0> cpr[N]; # next month's CPR (endo)
+
+    real incentive[N]; #purchase rate spread over mkt mortgage rate
+    int<lower=1,upper=12> month[N]; #month of year (seasonality)
+}
+parameters {
+    real season[12]; #seasonality constant
+    real beta; #factor betas
+    real intercept; #base alpha
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[12] shrunk_season;
+    vector[N] phi; #mu
+    for(i in 1:12) {
+        shrunk_season[i] = intercept + season[i];
+    }
+    for(n in 1:N) {
+        phi[n] = inv_logit(shrunk_season[month[n]] + beta * incentive[n]);
+    }
+}
+model {
+    to_vector(season) ~ normal(0, 0.1);
+    intercept ~ normal(0,0.1);
+    beta ~ normal(0, 10);
+    lambda ~ pareto(0.1, 1.5); #As per Gelman, 2013, ch. 5
+    cpr ~ beta(lambda * phi, lambda*(1-phi));
+}
+generated quantities {
+   vector[N] log_lik;
+   vector[N] cpr_pred;
+
+   for(n in 1:N) {
+        log_lik[n] = beta_lpdf(cpr[n] | lambda*phi[n],lambda*(1-phi[n]));
+        cpr_pred[n] = cpr_pred_abbrev_rng(lambda, phi[n]);
+   }
+} 
+
+"
+cpr <- sample_data$next_month_cpr
+
+with(sample_data,
+fit <<- stan(model_code=stan_code, model_name="beta pool",
+            data=list(N=N, cpr=next_month_cpr2[1:N], 
+                      incentive=incentive[1:N], month=seasonality[1:N]),
+          iter=500, chains=4, pars=c("phi", "season", "intercept"), include=F))
+```
+
+```{r}
+print(fit, pars=c("beta","shrunk_season"))
+```
+
+Still negative beta for `incentive`. I *must* be doing something wrong.
+
+```{r}
+expose_stan_functions(fit@stanmodel)
+median_coefs <- sapply(extract(fit, 
+                               pars=c("shrunk_season", "beta", "lambda")),
+                       function(x) {
+    if(length(dim(x))>1){apply(x,2,median)} else {median(x)}
+                        })
+cpr_hat <- apply(sample_data,1,function(x){
+  cpr_pred_rng(median_coefs$shrunk_season,  median_coefs$beta,
+               median_coefs$lambda, as.numeric(x['seasonality']),
+               as.numeric(x['incentive']))})
+
+data.frame(cpr=cpr,cpr_hat=cpr_hat) %>% ggplot(aes(y=cpr_hat,x=cpr)) +
+  geom_point(alpha=0.1) + ggtitle("Next month CPR vs. Predicted")
+```
+
+Bugger. How about not even having an intercept?
+
+```{r}
+stan_code = "functions {
+    real cpr_pred_abbrev_rng(real lambda, real phi) {
+        real cpr_pred;
+        cpr_pred = beta_rng(lambda * phi, lambda * (1-phi));
+        return cpr_pred;
+    }
+    real cpr_pred_rng(real beta, real lambda, real incentive) {
+        real cpr_pred;
+        real phi; #mu
+        phi = inv_logit(beta * incentive);
+        return cpr_pred_abbrev_rng(lambda, phi);
+        }
+}
+data {
+    int N; #number of records
+
+    real<lower=0> cpr[N]; # next month's CPR (endo)
+
+    real incentive[N]; #purchase rate spread over mkt mortgage rate
+}
+parameters {
+    real beta; #factor betas
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+        phi[n] = inv_logit(beta * incentive[n]);
+    }
+}
+model {
+    beta ~ normal(0, 10);
+    lambda ~ pareto(0.1, 1.5); #As per Gelman, 2013, ch. 5
+    cpr ~ beta(lambda * phi, lambda*(1-phi));
+}
+generated quantities {
+   vector[N] log_lik;
+   vector[N] cpr_pred;
+
+   for(n in 1:N) {
+        log_lik[n] = beta_lpdf(cpr[n] | lambda*phi[n],lambda*(1-phi[n]));
+        cpr_pred[n] = cpr_pred_abbrev_rng(lambda, phi[n]);
+   }
+} 
+
+"
+cpr <- sample_data$next_month_cpr
+
+with(sample_data,
+fit <<- stan(model_code=stan_code, model_name="beta pool",
+            data=list(N=N, cpr=next_month_cpr2[1:N]),
+          iter=500, chains=4, pars=c("phi"), include=F))
+print(fit,pars=c("beta"))
+```
+
+Negative!
+
+```{r}
+expose_stan_functions(fit@stanmodel)
+median_coefs <- sapply(extract(fit, 
+                               pars=c("beta", "lambda")),
+                       function(x) {
+    if(length(dim(x))>1){apply(x,2,median)} else {median(x)}
+                        })
+cpr_hat <- apply(sample_data,1,function(x){
+  cpr_pred_rng(median_coefs[["beta"]], median_coefs[["lambda"]], 
+               as.numeric(x['incentive']))})
+
+data.frame(cpr=cpr,cpr_hat=cpr_hat) %>% ggplot(aes(y=cpr_hat,x=cpr)) +
+  geom_point(alpha=0.1) + ggtitle("Next month CPR vs. Predicted")
+```
+
+What does an ols look like?
+
+```{r}
+plot(lm(sample_data$next_month_cpr ~ sample_data$incentive))
+coef(lm(sample_data$next_month_cpr ~ sample_data$incentive))
+```
+
+Incentive is *still* negative. Could there be a problem with CPR? What does same-month CPR look like?

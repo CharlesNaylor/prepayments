@@ -1,0 +1,312 @@
+---
+title: "20170306 - Beta Regression with Probit, Bernoulli Regression"
+output: html_notebook
+---
+
+Maybe a cumulative normal link function will do better than logit?
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples3.csv") %>% 
+                rename(as_of_date=dt)
+#Scale it
+sample_data <- sample_data %>% mutate(burnout = burnout / 5000, 
+                                      cato = cato * 0.1, 
+                                      incentive = incentive * 5e-5, 
+                                      next_month_cpr = next_month_cpr * 0.01,
+                                      lockin = lockin * 1, 
+                                      upfront_mip = upfront_mip * 0.01)
+#filter out negative CPRs
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+
+#Transform cpr from [0,1] to (0,1)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% 
+  mutate(next_month_cpr2 = (next_month_cpr*(N-1) + 0.5)/N)
+
+#omit NA
+sample_data <- na.omit(sample_data)
+```
+
+
+# Swap inv_logit for Phi_approx
+```{r phi}
+stan_code <- "functions {
+    real cpr_pred_abbrev_rng(real lambda, real phi) {
+        real cpr_pred;
+        cpr_pred = beta_rng(lambda * phi, lambda * (1-phi));
+        return cpr_pred;
+    }
+    real cpr_pred_rng(real[] season, real[] beta, real lambda, real intercept,
+                    int month, real cato, real hpa, real lockin,
+                    real burnout, real incentive, real mip) {
+        real cpr_pred;
+        real phi; #mu
+        phi = Phi(intercept + season[month] +
+                    beta[1] * cato +
+                    beta[2] * hpa +
+                    beta[3] * lockin +
+                    beta[4] * burnout +
+                    beta[5] * incentive +
+                    beta[6] * mip);
+        return cpr_pred_abbrev_rng(lambda, phi);
+        }
+}
+data {
+    int N; #number of records
+
+    real<lower=0> cpr[N]; # next month's CPR (endo)
+
+    real cato[N]; #Curve at origination
+    real hpa[N]; # home price appreciation
+    real<lower=0> lockin[N]; #Lock-in rate
+    real burnout[N]; #burnout
+    real incentive[N]; #purchase rate spread over mkt mortgage rate
+    real<lower=0> mip[N]; #mortgage insurance rate
+    int<lower=1,upper=12> month[N]; #month of year (seasonality)
+}
+parameters {
+    real season[12]; #seasonality constant
+    real beta[6]; #factor betas
+    real intercept; #base alpha
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[12] shrunk_season;
+    vector[N] phi; #mu
+    for(i in 1:12) {
+        shrunk_season[i] = intercept + season[i];
+    }
+    for(n in 1:N) {
+        phi[n] = Phi(shrunk_season[month[n]] +
+                                beta[1] * cato[n] +
+                                beta[2] * hpa[n] +
+                                beta[3] * lockin[n] +
+                                beta[4] * burnout[n] +
+                                beta[5] * incentive[n] +
+                                beta[6] * mip[n]);
+    }
+}
+model {
+    to_vector(season) ~ normal(0, 0.1);
+    intercept ~ normal(0,0.1);
+    to_vector(beta) ~ normal(0, 10);
+    lambda ~ pareto(0.1, 1.5); #As per Gelman, 2013, ch. 5
+    cpr ~ beta(lambda * phi, lambda*(1-phi));
+}
+generated quantities {
+   vector[N] log_lik;
+   vector[N] cpr_pred;
+
+   for(n in 1:N) {
+        log_lik[n] = beta_lpdf(cpr[n] | lambda*phi[n],lambda*(1-phi[n]));
+        cpr_pred[n] = cpr_pred_abbrev_rng(lambda, phi[n]);
+   }
+}
+"
+
+N = nrow(sample_data)
+with(sample_data,
+fit_phi <<- stan(model_code = stan_code, model_name="beta-phi pool",
+            data=list(N=N, cpr=next_month_cpr2, cato=cato,
+                      hpa=hpa, lockin=lockin,
+                      burnout=burnout, incentive=incentive,
+                    mip=upfront_mip, month=seasonality),
+          iter=1000, chains=4, sample_file="pool_betaphi.smpl",
+          pars=c("phi"), include=F))
+print(fit_phi, pars=c("beta", "shrunk_season", "lambda"), include=T)
+```
+Can't make it work.
+
+
+# Bernoulli instead of Beta
+
+```{r bernoulli}
+stan_code <- "functions {
+    real cpr_pred_abbrev_rng(real alpha) {
+        real cpr_pred;
+        cpr_pred = bernoulli_logit_rng(alpha);
+        return cpr_pred;
+    }
+    real cpr_pred_rng(real[] season, real[] beta, real lambda, real intercept,
+                    int month, real cato, real sato, real hpa, real lockin,
+                    real burnout, real incentive, real mip) {
+        real cpr_pred;
+        real alpha; #mu
+        alpha = intercept + season[month] +
+                    beta[1] * cato +
+                    beta[2] * sato +
+                    beta[3] * hpa +
+                    beta[4] * lockin +
+                    beta[5] * burnout +
+                    beta[6] * incentive +
+                    beta[7] * mip;
+        return cpr_pred_abbrev_rng(alpha);
+        }
+}
+data {
+    int N; #number of records
+
+    real<lower=0> cpr[N]; # next month's CPR (endo)
+
+    real cato[N]; #Curve at origination
+    real sato[N]; #spread at origination
+    real hpa[N]; # home price appreciation
+    real<lower=0> lockin[N]; #Lock-in rate
+    real burnout[N]; #burnout
+    real incentive[N]; #purchase rate spread over mkt mortgage rate
+    real<lower=0> mip[N]; #mortgage insurance rate
+    int<lower=1,upper=12> month[N]; #month of year (seasonality)
+}
+parameters {
+    real season[12]; #seasonality constant
+    real beta[7]; #factor betas
+    real intercept; #base alpha
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[12] shrunk_season;
+    vector[N] alpha; #mu
+    for(i in 1:12) {
+        shrunk_season[i] = intercept + season[i];
+    }
+    for(n in 1:N) {
+        alpha[n] = shrunk_season[month[n]] +
+                              beta[1] * cato[n] +
+                              beta[2] * sato[n] +
+                              beta[3] * hpa[n] +
+                              beta[4] * lockin[n] +
+                              beta[5] * burnout[n] +
+                              beta[6] * incentive[n] +
+                              beta[7] * mip[n];
+    }
+}
+model {
+    to_vector(season) ~ normal(0, 0.1);
+    intercept ~ normal(0,0.1);
+    to_vector(beta) ~ normal(0, 10);
+    cpr ~ bernoulli_logit(alpha);
+}
+generated quantities {
+   vector[N] log_lik;
+   vector[N] cpr_pred;
+
+   for(n in 1:N) {
+        log_lik[n] = bernoulli_logit_pdf(cpr[n] | alpha[n]);
+        cpr_pred[n] = cpr_pred_abbrev_rng(alpha[n]);
+   }
+}
+"
+
+N = nrow(sample_data)
+with(sample_data,
+fit_bern <<- stan(model_code = stan_code, model_name="beta-phi pool",
+            data=list(N=N, cpr=next_month_cpr2, cato=cato,
+                      sato=sato, hpa=hpa, lockin=lockin,
+                      burnout=burnout, incentive=incentive,
+                    mip=upfront_mip, month=seasonality),
+          iter=1000, chains=4, sample_file="pool_bernoulli.smpl",
+          pars=c("phi"), include=F))
+print(fit_bernoulli, pars=c("beta", "shrunk_season"), include=T)
+```
+...right. That's why I didn't do it before. I could reduce CPR to int and see if it works at all.
+```{r bernoulli2}
+stan_code <- "functions {
+    real cpr_pred_abbrev_rng(real alpha) {
+        int cpr_pred;
+        cpr_pred = bernoulli_logit_rng(alpha);
+        return cpr_pred;
+    }
+    real cpr_pred_rng(real[] season, real[] beta, real lambda, real intercept,
+                    int month, real cato, real sato, real hpa, real lockin,
+                    real burnout, real incentive, real mip) {
+        int cpr_pred;
+        real alpha; #mu
+        alpha = intercept + season[month] +
+                    beta[1] * cato +
+                    beta[2] * sato +
+                    beta[3] * hpa +
+                    beta[4] * lockin +
+                    beta[5] * burnout +
+                    beta[6] * incentive +
+                    beta[7] * mip;
+        return cpr_pred_abbrev_rng(alpha);
+        }
+}
+data {
+    int N; #number of records
+
+    int<lower=0> cpr[N]; # next month's CPR (endo)
+
+    real cato[N]; #Curve at origination
+    real sato[N]; #spread at origination
+    real hpa[N]; # home price appreciation
+    real<lower=0> lockin[N]; #Lock-in rate
+    real burnout[N]; #burnout
+    real incentive[N]; #purchase rate spread over mkt mortgage rate
+    real<lower=0> mip[N]; #mortgage insurance rate
+    int<lower=1,upper=12> month[N]; #month of year (seasonality)
+}
+parameters {
+    real season[12]; #seasonality constant
+    real beta[7]; #factor betas
+    real intercept; #base alpha
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[12] shrunk_season;
+    vector[N] alpha; #mu
+    for(i in 1:12) {
+        shrunk_season[i] = intercept + season[i];
+    }
+    for(n in 1:N) {
+        alpha[n] = shrunk_season[month[n]] +
+                              beta[1] * cato[n] +
+                              beta[2] * sato[n] +
+                              beta[3] * hpa[n] +
+                              beta[4] * lockin[n] +
+                              beta[5] * burnout[n] +
+                              beta[6] * incentive[n] +
+                              beta[7] * mip[n];
+    }
+}
+model {
+    to_vector(season) ~ normal(0, 0.1);
+    intercept ~ normal(0,0.1);
+    to_vector(beta) ~ normal(0, 10);
+    cpr ~ bernoulli_logit(alpha);
+}
+generated quantities {
+   vector[N] log_lik;
+   vector[N] cpr_pred;
+
+   for(n in 1:N) {
+        log_lik[n] = bernoulli_logit_lpmf(cpr[n] | alpha[n]);
+        cpr_pred[n] = cpr_pred_abbrev_rng(alpha[n]);
+   }
+}
+"
+
+with(sample_data %>% mutate(bern_cpr=as.numeric(next_month_cpr>0.85)),
+fit_bern <<- stan(model_code = stan_code, model_name="bernoulli pool",
+            data=list(N=N, cpr=bern_cpr, cato=cato,
+                      sato=sato, hpa=hpa, lockin=lockin,
+                      burnout=burnout, incentive=incentive,
+                    mip=upfront_mip, month=seasonality),
+          iter=1000, chains=4, sample_file="pool_bernoulli.smpl",
+          pars=c("phi"), include=F))
+print(fit_bern, pars=c("beta", "shrunk_season"), include=T)
+```
+```{r}
+print(fit_bern, pars=c("beta", "shrunk_season"), include=T)
+```
+
+Geeze. WTF is with the beta on `incentive`? Meanwhile, divergent transitions, failure to mix on all chains.
+

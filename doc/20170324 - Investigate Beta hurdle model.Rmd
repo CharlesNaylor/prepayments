@@ -1,0 +1,495 @@
+---
+title: "20170321 - Poisson with Extra Data"
+output: html_notebook
+---
+
+Since I had some success with the Poisson model, I retrieved 50,000 samples using the JPM paper's set of factors. Let's give it a wider test.
+
+```{r}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples4.csv") %>%
+  select(-X1,-level_1) %>% rename(cusip=level_0)
+```
+
+Scaling
+```{r}
+sample_data <- sample_data[-4184,] #Get rid of the parsing error
+
+sample_data <- sample_data %>% mutate(burnout = burnout * 5e-6, 
+                                      cato = cato * 1, 
+                                      next_month_cpr = round(next_month_cpr),
+                                      incentive = incentive * 5e-4, 
+                                      lockin = lockin * 200, 
+                                      sato = sato * 1, 
+                                      hpa = hpa * 5,
+                                      upfront_mip = upfront_mip * 0.01)
+#filter out negative CPRs and missing HPAs (which are probably in Puerto Rico)
+sample_data <- sample_data %>% filter(next_month_cpr >= 0) %>% na.omit()
+
+
+
+sample_data %>% select(-wala, -cusip, -lockin) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+OK, let's do a short run first. I'm going to keep in all these variables this time.
+
+There's so much data I'll probably keep most of it out of memory, or possibly just run the MLE optimizer on the full set.
+
+```{r}
+
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] + beta * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(1,1); #upfront_mip
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,5); #cato
+  beta[5] ~ normal(0,1); #sato
+  beta[6] ~ normal(-1,1); #burnout
+  
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) {
+      endo_hat[n] = (1-theta) * poisson_rng(lambda[n]);
+  }
+}
+
+"
+N=5000
+small_data <- sample_data %>% sample_n(size=N)
+fit <- stan(model_code=stan_code, 
+            model_name="poisson_hurdle",
+            data=list(N=N, K=6, 
+                      exogs=small_data %>% 
+                        select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                      month=small_data$seasonality,
+                      endo=small_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("mu", "lambda"), include=FALSE)
+
+```
+
+```{r}
+print(fit, pars=c("beta"))
+```
+
+```{r}
+#NB. note breaks are in reverse order for the custom labels. You can verify against
+# print(fit) that this is necessary.
+beta_labels <- c("incentive","upfront_mip","hpa","cato","sato","burnout")
+stan_plot(fit, pars=c("beta")) + ggtitle("Global Betas") + 
+  scale_y_continuous(breaks=seq.int(6,1), labels=beta_labels)+
+  theme(axis.line=element_blank())
+```
+
+This one looks really good. All the betas are roughly where I think they should be. Month Intercepts are a bit off (mid summer < 0, Nov. and Dec. > 0).
+
+Let's do the full one, then I want one with shrunk vintages.
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] + beta * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(1,1); #upfront_mip
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,5); #cato
+  beta[5] ~ normal(0,1); #sato
+  beta[6] ~ normal(-1,1); #burnout
+  
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) {
+      endo_hat[n] = (1-theta) * poisson_rng(lambda[n]);
+  }
+}
+
+"
+N=nrow(sample_data)
+poisson_hurdle <- stan_model(model_code=stan_code, model_name="poisson_hurdle")
+mle_fit <- optimizing(poisson_hurdle,
+            data=list(N=N, K=6, 
+                      exogs=sample_data %>% 
+                        select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                      month=sample_data$seasonality,
+                      endo=sample_data$next_month_cpr))
+
+```
+That was crazy fast.
+```{r}
+mle_fit$par[1:20]
+```
+
+Nov. Intercept flipped negative on the larger dataset. Month_intercept now looks totally correct to me, if pretty much irrelevant.
+
+Vintage time, on the sub-sample.
+
+```{r vintage_hurdle}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int month[N]; 
+    int vintage[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[K,V] vintage_beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] 
+                        + (beta + vintage_beta[, vintage[n]]') * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(1,1); #upfront_mip
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,5); #cato
+  beta[5] ~ normal(0,1); #sato
+  beta[6] ~ normal(-1,1); #burnout
+  to_vector(vintage_beta) ~ normal(0,0.1); #per-vintage betas
+  
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) {
+      endo_hat[n] = (1-theta) * poisson_rng(lambda[n]);
+  }
+}
+
+"
+library(lubridate)
+N=nrow(small_data)
+small_data <- small_data %>% mutate(origin_dt=dt %m-% months(wala),
+                                    vintage=year(origin_dt) - min(year(origin_dt))+1)
+poisson_hurdle_vintage <- stan_model(model_code=stan_code, model_name="poisson_hurdle_vintage")
+fit_phv <- sampling(poisson_hurdle_vintage,
+              data=list(N=N, K=6, V=length(unique(small_data$vintage)),
+                        exogs=small_data %>% 
+                          select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                        month=small_data$seasonality,
+                        vintage=small_data$vintage,
+                        endo=small_data$next_month_cpr),
+              chains=4, iter=500, pars=c("lambda", "mu"), include=FALSE)
+
+```
+42 minutes on 5000 data points. Means 6.5 hours on the full set. Still doable. Is it worth it?
+
+```{r}
+library(loo)
+loo_ph <- loo(extract_log_lik(fit))
+loo_phv <- loo(extract_log_lik(fit_phv))
+compare(loo_ph,loo_phv)
+```
+
+It's better than the first model. Shouldn't be surprising as there are more free parameters. Do the betas still look sane?
+
+```{r}
+beta_labels <- c("incentive","upfront_mip","hpa","cato","sato","burnout")
+stan_plot(fit_phv, pars=c("beta")) + 
+  ggtitle("Global Betas", subtitle="(with confidence intervals)") + 
+  scale_y_continuous(breaks=seq.int(6,1), labels=beta_labels)+
+  theme(axis.line=element_blank())
+```
+
+And vintage...
+```{r}
+min_year <- year(min(small_data$origin_dt))
+vb_data <- rstan:::.make_plot_data(fit_phv, c("vintage_beta"))$samp
+vb_data <- vb_data %>% group_by(parameter) %>% 
+  summarize(min=quantile(value,0.025), low=quantile(value,0.25),mid=median(value),
+            high=quantile(value,0.75), max=quantile(value,0.975)) %>%
+  mutate(beta=factor(as.numeric(substr(parameter,14,14)),  labels=beta_labels),
+         vintage=min_year - 1 + as.numeric(gsub("vintage_beta\\[[1-6],([0-9]+)\\]",
+                                                "\\1",parameter)))
+vb_data %>% ggplot(aes(y=vintage)) + facet_wrap(~beta) + 
+  geom_segment(aes(yend=vintage,x=min,xend=max)) + 
+  geom_segment(aes(yend=vintage,x=low,xend=high,colour="red",size=1,alpha=0.75)) +
+  geom_point(aes(x=mid)) + theme_minimal() + xlab("Beta") +
+  ggtitle("Vintage-specific Betas") + theme(legend.position = "none")
+```
+
+Interesting. Maybe too many free parameters. Good news is it's mixing on only 500 iterations. Let's do a run on all the data, see if these come in a bit.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int month[N]; 
+    int vintage[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[K,V] vintage_beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] 
+                        + (beta + vintage_beta[, vintage[n]]') * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(1,1); #upfront_mip
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,5); #cato
+  beta[5] ~ normal(0,1); #sato
+  beta[6] ~ normal(-1,1); #burnout
+  to_vector(vintage_beta) ~ normal(0,0.1); #per-vintage betas
+  
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+
+"
+
+N=nrow(sample_data)
+sample_data <- sample_data %>% mutate(origin_dt=dt %m-% months(wala),
+                                    vintage=year(origin_dt) - min(year(origin_dt))+1)
+
+fit_phv <- stan(model_code=stan_code,
+              data=list(N=N, K=6, V=length(unique(sample_data$vintage)),
+                        exogs=sample_data %>% 
+                          select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                        month=sample_data$seasonality,
+                        vintage=sample_data$vintage,
+                        endo=sample_data$next_month_cpr),
+              chains=4, iter=500, pars=c("lambda", "mu"), include=FALSE)
+```
+
+about an hour.
+
+Did it mix?
+```{r}
+traceplot(fit_phv,pars=c("beta","intercept"))
+```
+
+Looks ok. Don't think I'd want to run less than 500, though.
+
+```{r}
+min_year <- year(min(small_data$origin_dt))
+vb_data <- rstan:::.make_plot_data(fit_phv, c("vintage_beta"))$samp
+vb_data <- vb_data %>% group_by(parameter) %>% 
+  summarize(min=quantile(value,0.025), low=quantile(value,0.25),mid=median(value),
+            high=quantile(value,0.75), max=quantile(value,0.975)) %>%
+  mutate(beta=factor(as.numeric(substr(parameter,14,14)),  labels=beta_labels),
+         vintage=min_year - 1 + as.numeric(gsub("vintage_beta\\[[1-6],([0-9]+)\\]",
+                                                "\\1",parameter)))
+vb_data %>% ggplot(aes(y=vintage)) + facet_wrap(~beta) + geom_vline(aes(xintercept=0)) +
+  geom_segment(aes(yend=vintage,x=min,xend=max)) + 
+  geom_segment(aes(yend=vintage,x=low,xend=high,colour="red",size=0.1)) +
+  geom_point(aes(x=mid)) + theme_minimal() + xlab("Beta") + ylab("Year") +
+  ggtitle("Year-specific Betas", subtitle="(add to global betas)") + theme(legend.position = "none")
+```
+
+Well, confidence intervals came way in, but beta values actually blew out. At least there looks like a lot more serial correlation.
+
+Do the global betas still do what I want?
+
+```{r}
+stan_plot(fit_phv, pars=c("beta")) + geom_vline(aes(xintercept=0),col="grey9",alpha=0.5) +
+  ggtitle("Global Betas", subtitle="(with confidence intervals)") + 
+  scale_y_continuous(breaks=seq.int(6,1), labels=beta_labels)+
+  theme(axis.line=element_blank())
+```
+
+Upfront MIP went the other way.
+
+
+Ok, last thing to check. Do I need to iterate over log_lik to increment the target log-probability? Or can I just assign the sum of log_lik? Probably good for a speedup.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int month[N]; 
+    int vintage[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[K,V] vintage_beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] 
+                        + (beta + vintage_beta[, vintage[n]]') * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(1,1); #upfront_mip
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,5); #cato
+  beta[5] ~ normal(0,1); #sato
+  beta[6] ~ normal(-1,1); #burnout
+  to_vector(vintage_beta) ~ normal(0,0.1); #per-vintage betas
+  
+  target += sum(log_lik);
+}
+
+"
+
+N=nrow(sample_data)
+sample_data <- sample_data %>% mutate(origin_dt=dt %m-% months(wala),
+                                    vintage=year(origin_dt) - min(year(origin_dt))+1)
+
+fit_phv2 <- stan(model_code=stan_code, model_name="p_hurdle_speedup",
+              data=list(N=N, K=6, V=length(unique(sample_data$vintage)),
+                        exogs=sample_data %>% 
+                          select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                        month=sample_data$seasonality,
+                        vintage=sample_data$vintage,
+                        endo=sample_data$next_month_cpr),
+              chains=4, iter=500, pars=c("lambda", "mu"), include=FALSE)
+
+```
+No speedup. Is it even the same model?
+
+```{r}
+stan_plot(fit_phv2, pars=c("beta")) + geom_vline(aes(xintercept=0),col="grey9",alpha=0.5) +
+  ggtitle("Global Betas", subtitle="(with confidence intervals)") + 
+  scale_y_continuous(breaks=seq.int(6,1), labels=beta_labels)+
+  theme(axis.line=element_blank())
+```
+
+Yes, seems to be. I guess sum(vector) and for(i in 1:N) {target+= vector[i]} look the same in the compiled model.
+
+Run the older one for a long time.
+```{r}
+fit_phv2 <- stan(model_code=stan_code,
+              data=list(N=N, K=6, V=length(unique(sample_data$vintage)),
+                        exogs=sample_data %>% 
+                          select(incentive, upfront_mip, hpa, cato, sato, burnout) %>% as.matrix,
+                        month=sample_data$seasonality,
+                        vintage=sample_data$vintage,
+                        endo=sample_data$next_month_cpr),
+              chains=4, iter=5000, thin=10, pars=c("lambda", "mu"), include=FALSE)
+```
+

@@ -1,0 +1,296 @@
+---
+title: "20170320 - Poisson"
+output: html_notebook
+---
+
+Round CPR to 1 - 100 int, use Poisson, possibly zero-inflated, possibly hurdle model.
+```{r setup}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples2.csv") %>%
+  select(-X1,-level_1) %>% rename(cusip=level_0)
+```
+
+Scaling
+```{r}
+sample_data %>% select(-cusip) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+`lockin`, and `incentive` have similar multi-modal distributions.
+
+```{r}
+library(GGally)
+ggpairs(sample_data, columns=c("incentive","sato","lockin","next_month_cpr"))
+```
+
+Well, there doesn't seem to be much point to including lockin. On to scaling.
+CPR needs to be an integer >= 0 for this one.
+
+```{r}
+scaled_data <- sample_data %>% filter(next_month_cpr >= 0) %>% na.omit()
+N <- nrow(scaled_data)
+scaled_data <- scaled_data %>%
+    mutate(burnout = burnout * 5e-6,
+           hpa = hpa * 5,
+           incentive = incentive * 7.5e-4,
+           lockin = lockin * 2,
+           sato = sato * 1,
+           scaled_wala = wala * 3e-2,
+           upfront_mip = upfront_mip * 1e-1,
+           next_month_cpr = round(next_month_cpr))
+
+ scaled_data %>% select(-wala, -cusip, -lockin) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+
+```{r}
+library(GGally)
+
+scaled_data %>% select(-cusip) %>% na.omit() %>% sample_n(size=1000) %>%
+  ggpairs(mapping = ggplot2::aes(alpha=0.01),
+          upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+Still not clear why there's no upfront mip before 2010 or so. Maybe those pools all got refinanced.
+
+
+```{r}
+
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] + beta * exogs[n]';
+      lambda[n] = exp(mu[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(-1,1); #sato
+  endo ~ poisson(lambda);
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = poisson_lpmf(endo[n] | lambda[n]);
+    endo_hat[n] = poisson_rng(lambda[n]);
+  }
+}
+
+"
+fit <- stan(model_code=stan_code, 
+            model_name="poisson",
+            data=list(N=N, K=4, 
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = incentive+upfront_mip) %>%
+                        select(incentmip, cato, hpa, sato) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("lambda"), include=FALSE)
+```
+
+Love these fast models.
+
+```{r}
+print(fit, pars=c("beta"))
+```
+
+Nice. Positive beta on everything. Easier to interpret than a beta regression, too. Those betas are straight 1-1 multiplicative effects.
+
+```{r}
+print(fit, pars=c("intercept", "month_intercept"))
+```
+
+Intercept higher in summer months. Check.
+
+I looked at the fit in shinystan. We're good on everything except that the posterior predictive check shows we heavily underestimate 0s. Which isn't too much of a surprise.
+```{r}
+cpr_hat <- extract(fit,pars="endo_hat")[["endo_hat"]]
+cpr_resid <- cpr_hat - tcrossprod(rep(1,4000),scaled_data$next_month_cpr)
+data.frame(median_resid=apply(cpr_resid,2,median)) %>%
+  ggplot(aes(x=median_resid)) + geom_histogram() + ggtitle("Distribution of median residuals")
+```
+
+Let's try a zero-inflated model to correct for that. cf. Stan Manual 2.14, p191.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] + beta * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log_sum_exp(bernoulli_lpmf(1 | theta),
+                              bernoulli_lpmf(0 | theta) + poisson_lpmf(endo[n] | lambda[n]));
+      else
+        log_lik[n] = bernoulli_lpmf(0 | theta) + poisson_lpmf(endo[n] | lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(-1,1); #sato
+  theta ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) {
+      endo_hat[n] = (1-theta) * poisson_rng(lambda[n]);
+  }
+}
+
+"
+fit_0inf <- stan(model_code=stan_code, 
+            model_name="poisson_0inflated",
+            data=list(N=N, K=4, 
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = incentive+upfront_mip) %>%
+                        select(incentmip, cato, hpa, sato) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("lambda"), include=FALSE)
+```
+
+Takes 3 times longer. Not too bad.
+
+```{r}
+print(fit_0inf, pars=c("beta","theta"))
+```
+
+```{r}
+print(fit_0inf, pars=c("intercept", "month_intercept"))
+```
+
+Which model fit better?
+```{r}
+loo::compare(loo::loo(loo::extract_log_lik(fit)),loo::loo(loo::extract_log_lik(fit_0inf)))
+```
+
+Zero-inflated fits better. Still not great, but when 70% of your data equals 0, allowances must be made. Note that `theta` exactly found that proportion (69.5%). I'm surprised the beta values actually went *down*. I'd have thought the opposite.
+
+Let's look at a hurdle model. cf. Stan Reference Manual 2.14, pp192 - 194 for the convoluted speed-up measures I'm taking here.
+
+```{r hurdle}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    int endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0, upper=1> theta;
+}
+transformed parameters {
+    vector<lower=0>[N] lambda;
+    vector[N] mu;
+    real log_lik[N];
+    for(n in 1:N) {
+      mu[n] = intercept +  month_intercept[month[n]] + beta * exogs[n]';
+      lambda[n] = exp(mu[n]);
+      if(endo[n] == 0) 
+        log_lik[n] = log(theta);
+      else
+        log_lik[n] = log1m(theta) + poisson_lpmf(endo[n] | lambda[n]) 
+                      - log1m_exp(-lambda[n]);
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(-1,1); #sato
+  theta ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  for(n in 1:N) {
+    target += log_lik[n];
+  }
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) {
+      endo_hat[n] = (1-theta) * poisson_rng(lambda[n]);
+  }
+}
+
+"
+fit_hurdle <- stan(model_code=stan_code, 
+            model_name="poisson_hurdle",
+            data=list(N=N, K=4, 
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = incentive+upfront_mip) %>%
+                        select(incentmip, cato, hpa, sato) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("lambda"), include=FALSE)
+```
+
+```{r}
+print(fit_hurdle, pars=c("beta","theta"))
+```
+
+Same answers, much faster.
+
+```{r}
+loo_0inf <- loo::loo(loo::extract_log_lik(fit_0inf))
+loo_hurdle <- loo::loo(loo::extract_log_lik(fit_hurdle))
+
+loo::compare(loo_0inf, loo_hurdle)
+```
+
+Very slightly worse. So I could just do this via the hurdle model and save some time. There's also a big speed-up for hurdle that I didn't implement.
+
+OK, I think this is the way to proceed. Let's get this written up as the PoolModel model, and estimate on more data.

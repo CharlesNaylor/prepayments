@@ -1,0 +1,89 @@
+---
+title: "Beta Regression with rstanarm"
+output: html_notebook
+---
+
+Can I squeeze my problem into the standard specification offered by `rstanarm`? They're supposed to have coded their models pretty efficiently. I'll be following <a href=https://cran.rstudio.com/web/packages/rstanarm/vignettes/betareg.html>this vignette</a>.
+
+The main issue would be that seasonality will need to be handled with a design matrix. I don't think we're inverting exog matrix anywhere, so maybe that's fine.
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+library(rstanarm)
+
+sample_data = read_csv("data/samples.csv") %>% 
+                rename(pool_number=X1, as_of_date=X2)
+#Scale it
+sample_data <- sample_data %>% mutate(burnout = burnout * 1e-6, 
+                                      cato = cato * 0.1, 
+                                      next_month_cpr = next_month_cpr * 1e-2,
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 1, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+#filter out negative CPRs
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+
+```
+
+...actually, from reading the vignette, I think I can just specify seasonality as `1 | month`, so I'm setting eval=F on the next chunk.
+
+```{r, eval=FALSE}
+sample_data <- sample_data %>% mutate(month_1 = ifelse(seasonality==1,1,0),
+                                      month_2 = ifelse(seasonality==2,1,0),
+                                      month_3 = ifelse(seasonality==3,1,0),
+                                      month_4 = ifelse(seasonality==4,1,0),
+                                      month_5 = ifelse(seasonality==5,1,0),
+                                      month_6 = ifelse(seasonality==6,1,0),
+                                      month_7 = ifelse(seasonality==7,1,0),
+                                      month_8 = ifelse(seasonality==8,1,0),
+                                      month_9 = ifelse(seasonality==9,1,0),
+                                      month_10 = ifelse(seasonality==10,1,0),
+                                      month_11 = ifelse(seasonality==11,1,0),
+                                      month_12 = ifelse(seasonality==12,1,0))
+```
+
+```{r betareg}
+# Transform cpr from [0,1] to (0,1)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% 
+  mutate(next_month_cpr2 = (next_month_cpr*(N-1) + 0.5)/N)
+
+fit <- stan_betareg(next_month_cpr2 ~ cato + sato + hpa + lockin + burnout + 
+                      incentive + upfront_mip + 1 | seasonality, 
+                    data=sample_data[1:2500,], link="logit", chains=4, 
+                    cores=4, iter=1000, prior_intercept=normal(0,1),
+                    prior=normal(0,1), prior_phi=normal(0,1))
+round(coef(fit), 2)
+```
+Unless I'm interpreting beta regression incorrectly, most of these coefficients are opposite to what they should be. You have a large intercept and then items subtracting from it.
+
+What does phi_intercept mean? I thought phi must be > 0.
+
+
+They seem to be stable, moreover; I've run it a few times.
+
+Do I have seasonality specified correctly?
+
+How does it compare to my normal model? Need to run normal model again with explicitly generated loglikelihood to compare.
+
+The betas for the normal model were:
+(Intercept)              cato              sato 
+             0.15             -0.08             0.09 
+              hpa            lockin           burnout 
+            0.0126             -0.01              -0.37 
+        incentive       upfront_mip (phi)_(Intercept) 
+            -0.225             -0.06
+            
+So that had both `burnout` and `incentive` facing the wrong way.
+
+`burnout` and `incentive` are likely collinear.
+
+Let's try a Beta regression written by hand by myself.

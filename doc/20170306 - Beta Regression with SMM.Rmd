@@ -1,0 +1,190 @@
+---
+title: "20170306 Beta Regression directly in Stan"
+output: html_notebook
+---
+
+Does it make any difference if I regress against SMM instead of CPR? Probably not.
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples2.csv") %>% 
+                rename(pool_number=X1, as_of_date=X2)
+#Scale it
+sample_data <- sample_data %>% mutate(burnout = burnout / 5000, 
+                                      cato = cato * 0.1, 
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 1, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+```
+
+Transform cpr from [0,1] to (0,1)
+
+```{r}
+#filter out negative CPRs
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+
+N <- nrow(sample_data)
+sample_data <- sample_data %>% 
+  mutate(next_month_cpr2 = (next_month_cpr*(N-1) + 0.5)/N)
+```
+
+What is the relationship between `burnout` and `incentive`?
+
+```{r}
+sample_data %>% ggplot(aes(y=burnout, x=incentive)) + geom_point(alpha=0.1) +
+ geom_hline(yintercept=0) + geom_vline(xintercept=0) 
+```
+
+...significant. I may take out burnout for now. First let's do a clean run of my beta regression. Note bimodality in burnout at high incentive.
+```{r}
+library(GGally)
+
+sample_data[1:1000,] %>% ggpairs(columns=3:13, mapping=aes(alpha=0.05))
+```
+
+Let's try centering Incentive. All of our data is post-crisis, so incentive is rarely negative.
+```{r}
+sample_data %>% ggplot(aes(x=incentive)) + geom_histogram(bins=50) +
+  ggtitle(median(sample_data$incentive))
+
+```
+
+
+
+```{r}
+N = nrow(sample_data)
+#N = 5000
+stan_code = "/home/charles/src/LondonMirror/Prepayments/prepayments/stan/pool_beta.stan"
+with(sample_data,
+fit <<- stan(file=stan_code, model_name="beta pool",
+            data=list(N=N, cpr=next_month_cpr2[1:N], cato=cato[1:N],
+                      sato=sato[1:N], hpa=hpa[1:N], lockin=lockin[1:N],
+                      burnout=burnout[1:N], 
+                      incentive=incentive[1:N] - median(incentive[1:N]),
+                    mip=upfront_mip[1:N], month=seasonality[1:N]),
+          iter=1000, chains=4, sample_file="pool_beta.smpl",
+          pars=c("phi"), include=F))
+```
+
+```{r}
+print(fit, pars=c("beta", "shrunk_season", "lambda"), include=T)
+```
+Nope, incentive is still negative.
+
+It still looks to me like all these betas are the opposite of what they should be. Also seems weird that HPA is so insignificant.
+
+For reference:
+~~~~
+phi = inv_logit(intercept + season[month] +
+                     beta[1] * cato +
+                     beta[2] * sato +
+                     beta[3] * hpa +
+                     beta[4] * lockin +
+                     beta[5] * burnout +
+                     beta[6] * incentive +
+                     beta[7] * mip);
+~~~~
+
+The direct relationship between coefficients and `y` is inverse_logit: $$logit^{-1}(x) = \frac{1}{1+e^{-x}}$$ 
+
+This means *all* coefficients are positive, I believe. I should probably set wider priors on the betas, as inv_logit(-2) = 0.12, and inv_logit(2) = 0.88, and I have prior $\beta \sim N(0,1)$.
+
+Does a marginal positive change in `incentive` induce a positive, or negative change in the forecast?
+```{r}
+params <- extract(fit, pars=c("season", "beta", "intercept", "lambda"))
+median_coefs <- sapply(params, function(x) {
+    if(length(dim(x))>1){apply(x,2,median)} else {median(x)}
+  })
+
+inv_logit <- function(x) {1/(1+exp(-x))}
+
+relevant <- c('cato', 'sato', 'hpa', 'lockin', 'burnout', 'incentive', 'upfront_mip')
+pred_cpr <- function(x,b, details=F, dx=0) {
+  dxx <- function(b,dx) {b+dx}
+  ans <- c(b$intercept, b$season[x$seasonality], b$beta[1] * x$cato, 
+           b$beta[2] * x$sato, b$beta[3] * x$hpa, 
+           b$beta[4] * x$lockin, b$beta[5] * x$burnout,
+           b$beta[6] * dxx(x$incentive,dx), b$beta[7] * x$upfront_mip)
+  if(!details) {
+    ans <- inv_logit(sum(ans))
+  }
+  return(ans)
+}
+
+jim <- cbind(t(sample_data[5001,relevant]),
+             pred_cpr(sample_data[5001,],median_coefs,T)[3:9],
+             pred_cpr(sample_data[5001,],median_coefs,T,1)[3:9],
+             pred_cpr(sample_data[5001,],median_coefs,T,-1)[3:9]
+             )
+jim
+```
+Negative. So it's not working. `Sato` and `incentive` are interfering with each other, according to shinystan.
+
+I think I'll reparameterize seasonal to combine the intercept; they're interacting now and it's confusing. Removing `burnout` is worth looking at, too.
+
+```{r}
+N = nrow(sample_data)
+stan_code = "/home/charles/src/LondonMirror/Prepayments/prepayments/stan/pool_beta.stan"
+with(sample_data,
+fit <<- stan(file=stan_code, model_name="beta pool",
+            data=list(N=N, cpr=next_month_cpr2[1:N], cato=cato[1:N],
+                      sato=sato[1:N], hpa=hpa[1:N], lockin=lockin[1:N],
+                      burnout=burnout[1:N], incentive=incentive[1:N],
+                    mip=upfront_mip[1:N], month=seasonality[1:N]),
+          iter=5000, chains=4, sample_file="pool_beta.smpl",
+          pars=c("phi", "season", "intercept"), include=F))
+```
+
+```{r}
+print(fit, pars=c("log_lik","cpr_pred"), include=F)
+```
+
+```{r}
+params2 <- extract(fit, pars=c("shrunk_season", "beta"))
+median_coefs2 <- sapply(params2, function(x) {
+    if(length(dim(x))>1){apply(x,2,median)} else {median(x)}
+  })
+
+pred_cpr2 <- function(x,b, details=F, dx=0) {
+  dxx <- function(b,dx) {b+dx}
+  ans <- c(b$shrunk_season[x$seasonality], b$beta[1] * dxx(x$cato,dx), 
+           b$beta[2] * dxx(x$sato,dx), b$beta[3] * dxx(x$hpa,dx), 
+           b$beta[4] * dxx(x$lockin,dx), b$beta[5] * dxx(x$burnout,dx),
+           b$beta[6] * dxx(x$incentive,dx), b$beta[7] * dxx(x$upfront_mip,dx))
+  if(!details) {
+    ans <- inv_logit(sum(ans))
+  }
+  return(ans)
+}
+
+jim <- cbind(t(sample_data[5001,relevant]),
+             (pred_cpr(sample_data[5001,],median_coefs,T)[3:9]),
+             (pred_cpr2(sample_data[5001,],median_coefs2,T)[2:8])
+             )
+jim
+```
+
+Check 5% confidence interval on posterior.
+```{r}
+cpr_pred <- extract(fit, pars=c("cpr_pred"))[[1]]
+cpr_pred <- zapsmall(apply(cpr_pred,2,quantile,c(0.025,0.975)), digits=4)
+sum(sample_data$next_month_cpr[1:N] >= cpr_pred[1,] & sample_data$next_month_cpr[1:N] <= cpr_pred[2,]) / N
+```
+
+Pretty good. If anything it's a bit wide. Which side is it on?
+
+```{r}
+sum(sample_data$next_month_cpr[1:N] >= cpr_pred[1,]) / N
+sum(sample_data$next_month_cpr[1:N] <= cpr_pred[2,]) / N
+```
+
+Guess the 0 cutoff messes up 95% interval a bit. The first number is ideally 0.975.
+

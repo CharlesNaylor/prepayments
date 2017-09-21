@@ -1,0 +1,99 @@
+---
+title: "20170224 Beta Regression directly in Stan - No Burnin"
+output: html_notebook
+---
+
+If I remove burnin, does it flip some of the coefficients?
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("data/samples2.csv") %>% 
+                rename(pool_number=X1, as_of_date=X2)
+#Scale it
+sample_data <- sample_data %>% mutate(burnout = burnout * 1e-7, 
+                                      cato = cato * 0.1, 
+                                      next_month_cpr = next_month_cpr * 1e-2,
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 200, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+#filter out negative CPRs
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+
+# Transform cpr from [0,1] to (0,1)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% 
+  mutate(next_month_cpr2 = (next_month_cpr*(N-1) + 0.5)/N)
+```
+
+
+```{r}
+N = nrow(sample_data)
+#N = 5000
+stan_code = "/home/charles/src/LondonMirror/Prepayments/prepayments/stan/pool_beta.stan"
+with(sample_data,
+fit <<- stan(file=stan_code, model_name="beta pool",
+            data=list(N=N, cpr=next_month_cpr2[1:N], cato=cato[1:N],
+                      sato=sato[1:N], hpa=hpa[1:N], lockin=lockin[1:N],
+                      burnout=burnout[1:N], incentive=incentive[1:N],
+                    mip=upfront_mip[1:N], month=seasonality[1:N]),
+          iter=500, chains=4, sample_file="pool_beta2.smpl",
+          pars=c("phi", "season", "intercept"), include=F))
+```
+
+```{r}
+print(fit, pars=c("log_lik","cpr_pred"), include=F)
+```
+
+It still looks to me like all these betas are the opposite of what they should be. Also seems weird that HPA is so insignificant.
+
+For reference:
+~~~~
+phi = inv_logit(season[month] +
+                     beta[1] * cato +
+                     beta[2] * sato +
+                     beta[3] * hpa +
+                     beta[4] * lockin +
+                     beta[5] * incentive +
+                     beta[6] * mip);
+~~~~
+
+The direct relationship between coefficients and `y` is inverse_logit: $$logit^{-1}(x) = \frac{1}{1+e^{-x}}$$ 
+
+This means *all* coefficients are positive, I believe. I should probably set wider priors on the betas, as inv_logit(-2) = 0.12, and inv_logit(2) = 0.88, and I have prior $\beta \sim N(0,1)$.
+```{r}
+params <- extract(fit, pars=c("shrunk_season", "beta"))
+median_coefs <- sapply(params, function(x) {
+    if(length(dim(x))>1){apply(x,2,median)} else {median(x)}
+  })
+
+inv_logit <- function(x) {1/(1+exp(-x))}
+
+relevant <- c('cato', 'sato', 'hpa', 'lockin', 'incentive', 'upfront_mip')
+pred_cpr <- function(x,b, details=F, dx=0) {
+  dxx <- function(b,dx) {b+dx}
+  ans <- c(b$shrunk_season[x$seasonality], b$beta[1] * dxx(x$cato,dx), 
+           b$beta[2] * dxx(x$sato,dx), b$beta[3] * dxx(x$hpa,dx), 
+           b$beta[4] * dxx(x$lockin,dx), 
+           b$beta[5] * dxx(x$incentive,dx), b$beta[6] * dxx(x$upfront_mip,dx))
+  if(!details) {
+    ans <- inv_logit(sum(ans))
+  }
+  return(ans)
+}
+
+jim <- cbind(t(sample_data[5001,relevant]),
+             (pred_cpr(sample_data[5001,],median_coefs,T)[2:7]),
+             (pred_cpr(sample_data[5001,],median_coefs,T,1)[2:7]),
+             (pred_cpr(sample_data[5001,],median_coefs,T,-1)[2:7])
+             )
+jim
+```
+

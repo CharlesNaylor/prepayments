@@ -1,0 +1,304 @@
+---
+title: "20170310 - Popova Model with Full Histories"
+output: html_notebook
+---
+
+cf. Yesterday's popova Rmd and ipynb.
+
+I'm back to using CPR for endo. 
+
+Betas are:
+* incentive: WAC - prevailing mortgage rate, as before
+* spline: incentive cubed
+* burnout: WALA (can't do the more complicated burnout as I don't have all the historical data)
+* seasonality: 1 if it's the summer-time, i.e. May-August.
+* yield_curve: 10Y rate minus 2Y rate
+
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/ppm_fullhistory_samples.csv") %>%
+  rename(dt=major, cusip=minor)
+
+```
+
+How does the data look on this one?
+```{r}
+sample_data %>% sample_n(size = 5000) %>%
+  ggpairs(mapping=list(alpha=0.1), columns=c("endo","incentive","spline","burnout", "yc","dt"),
+                        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+
+Lots of outliers. What's going on with `incentive`? Some obvious weirdos in `endo` and `burnout`, too. Wonder if it's all the same data?
+```{r}
+sample_data %>% filter(endo > 50) %>% sample_n(size=5000) %>%
+  ggpairs(mapping=list(alpha=0.1), columns=c("endo","incentive","spline","burnout", "yc","dt"),
+                        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+
+Nope.
+
+Since CPRs are full time-series now, how do they look over time?
+```{r}
+cusips <- unique(sample_data$cusip)
+sample_cusips <- cusips %>% sample(size=100)
+sample_data %>% filter(cusip %in% sample_cusips) %>%
+  ggplot(aes(x=dt,y=endo, group=cusip)) + geom_line(alpha=0.1) + ylim(0,1)
+```
+
+Distribution of prepayments is skewed towards present b/c we are looking at BBG CPR data, which is only available for still-extant MBS pools.
+
+These still don't look like well-formed time series as in the literature. What's with many of these being 1 - 100, and many being 0 - 1?
+```{r}
+sum(sample_data$endo > 2)
+sum(sample_data$endo < 2)
+```
+More than 20% of them. BBG mistake? Is it at least consistent within a given CUSIP?
+
+```{r}
+sample_data %>% group_by(cusip) %>% 
+  summarize(big=sum(endo > 1.5), small=sum(endo <= 1.5)) %>%
+  mutate(pct_big = big / (big + small)) %>%
+  ggplot(aes(x=pct_big)) + geom_histogram()
+ 
+```
+
+Oh, ffs, the distribution of pct_big mirrors the distribution of endos overall. They are not bifurcated. The count of CPRs that are greater than they should be is too high to be a mistake.
+
+Should they all be big, and 0-1 just demonstrates the zero-inflation of the data set? I can test that, but I'll have to do it in python to get my calculation of CPRs.
+
+Alternately, is there a spike of values at 1? That might show that we have mixed presentation of data.
+```{r}
+sample_data %>% filter(endo < 2 & endo > 0.5) %>% 
+  ggplot(aes(x=endo)) + geom_histogram()
+```
+No, there isn't.
+
+I'm pretty confident that newer BBG data ranges 1 - 100. I checked in Python, and I think it's just that 80% of the values are basically 0.
+
+Now, what's with the split in incentive distribution?
+```{r}
+sample_data %>% ggplot(aes(x=incentive)) + geom_histogram()
+```
+There's not a lot of them up there.
+
+```{r}
+sample_data %>% filter(incentive > 0.75) %>% 
+  ggpairs(mapping=list(alpha=0.1), columns=c("endo","incentive","spline","burnout", "yc","dt"),
+                        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+Burnouts are wrong. I believe we can discard all these, as they are artifacts of pool entries with no `wac`.
+```{r}
+sample_data <- sample_data %>% filter(incentive > 0.75)
+```
+
+Does that take care of the bad burnout data, too?
+```{r}
+sample_data %>% ggplot(aes(x=burnout)) + geom_histogram()
+```
+
+WAC of 999 means burnout of 999, too. We'll discard those.
+```{r}
+sample_data <- sample_data %>% filter(incentive < 0.75) 
+sample_data %>% filter(endo >= 0) %>% #mutate(endo=sapply(endo, function(x){max(0,x)})) %>%
+  sample_n(size=5000) %>% ggpairs(mapping=list(alpha=0.1), columns=c("endo","incentive","spline","burnout", "yc","dt"),
+                        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+
+
+
+
+
+```{r}
+#Scale it, eliminate actual 0s and 1s
+sample_data <- sample_data %>% filter(endo >= 0)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% mutate(endo = ((N-1) * (endo * 1e-2) + 0.5)/N,
+                                      incentive = incentive * 10, 
+                                      spline = spline * 1.3e3, 
+                                      yc = yc * 0.5,
+                                      burnout=burnout * 0.33e-2)
+```
+
+Maybe we can do mixed-effects beta regression
+
+```{r stan_code, message=FALSE, warning=FALSE}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+  for(n in 1:N) {
+    phi[n] = inv_logit(intercept + beta * exogs[n]');
+  }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(beta) ~ normal(0, 10);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+
+"
+less_data <- sample_data %>% sample_n(size=10000)
+fit <- stan(model_code=stan_code, model_name="GNM2_beta_fullhist",
+            data=list(N=nrow(less_data), K=5,
+                      exogs=less_data %>% select(incentive,spline,burnout,yc, seasonality) %>% as.matrix, 
+                      endo=less_data$endo),
+            iter=2000, chains=4, pars=c("beta", "intercept", "lambda"))
+
+```
+```{r}
+fit
+```
+
+F it. I'm going to constrain `incentive` to a positive beta, and burnout to a negative beta. This is a data problem.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    real incentive[N];
+    real spline[N];
+    real burnout[N];
+    real yc[N];
+    real seasonality[N];
+    real endo[N];
+}
+parameters {
+    real<lower=0> B_incentive;
+    real B_spline;
+    real<upper=0> B_burnout;
+    real B_yc;
+    real<lower=0> B_seasonality;
+    real intercept;
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+  for(n in 1:N) {
+    phi[n] = inv_logit(intercept + 
+                    B_incentive * incentive[n] + 
+                    B_spline * spline[n] + 
+                    B_burnout * burnout[n] + 
+                    B_yc * yc[n] + 
+                    B_seasonality * seasonality[n]);
+  }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  B_incentive ~ normal(1,5);
+  B_spline ~ normal(0,5);
+  B_burnout ~ normal(-1,5);
+  B_yc ~ normal(0,5);
+  B_seasonality ~ normal(1,5);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+
+"
+less_data <- sample_data %>% sample_n(size=10000)
+fit <- stan(model_code=stan_code, model_name="GNM2_beta_fullhist",
+            data=list(N=nrow(less_data), incentive=less_data$incentive,
+                      spline=less_data$spline,burnout=less_data$burnout,
+                      yc=less_data$yc, seasonality=less_data$seasonality,
+                      endo=less_data$endo),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+
+```
+```{r}
+fit
+```
+
+YC should be positive, too. Let's have a look at that over time.
+```{r}
+sample_data %>% select(dt, yc) %>% group_by(dt) %>% summarize(yc=first(yc)) %>%
+  ggplot(aes(x=dt,y=yc)) + geom_line()
+```
+```{r}
+sample_data %>% sample_n(size=10000) %>% ggplot(aes(x=yc,y=endo)) + geom_point(alpha=0.05)
+```
+
+I should try to stick vintage in there directly. But that means rerunning the data sampler. I'll do one more with this set, constraining YC $\beta$ to be positive.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    real incentive[N];
+    real spline[N];
+    real burnout[N];
+    real yc[N];
+    real seasonality[N];
+    real endo[N];
+}
+parameters {
+    real<lower=0> B_incentive;
+    real B_spline;
+    real<upper=0> B_burnout;
+    real<lower=0> B_yc;
+    real<lower=0> B_seasonality;
+    real intercept;
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+  for(n in 1:N) {
+    phi[n] = inv_logit(intercept + 
+                    B_incentive * incentive[n] + 
+                    B_spline * spline[n] + 
+                    B_burnout * burnout[n] + 
+                    B_yc * yc[n] + 
+                    B_seasonality * seasonality[n]);
+  }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  B_incentive ~ normal(1,5);
+  B_spline ~ normal(0,5);
+  B_burnout ~ normal(-1,5);
+  B_yc ~ normal(1,5);
+  B_seasonality ~ normal(1,5);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real endo_hat[N];
+  for(n in 1:N) 
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+}
+
+"
+less_data <- sample_data %>% sample_n(size=10000)
+fit <- stan(model_code=stan_code, model_name="GNM2_beta_fullhist",
+            data=list(N=nrow(less_data), incentive=less_data$incentive,
+                      spline=less_data$spline,burnout=less_data$burnout,
+                      yc=less_data$yc, seasonality=less_data$seasonality,
+                      endo=less_data$endo),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+
+```{r}
+print(fit, pars=c("endo_hat"), include=F)
+```
+
+So now we have all the betas where they're supposed to be. But does the posterior predictive check hold?
+```{r}
+endos <- less_data$endo
+shinystan::launch_shinystan(fit)
+```
+
+It's no worse than any of the others. Moving on, I'm going to try pooling by vintage year.

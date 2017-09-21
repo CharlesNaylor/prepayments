@@ -1,0 +1,246 @@
+---
+title: "20170316 - Incentive, HPA, WALA, and Vintage Interactions"
+output: html_notebook
+---
+
+As noted <a href="doc/20170315 - Popova with Vintages.Rmd">yesterday</a>, when I was looking at a model with betas shrunk by pool vintage, the effects of *incentive*, *home price appreciation*, and *vintage*, or possibly *WALA*, are highly correlated in the period for which we have the greater mass of data. 
+
+So, how to incorporate these effects? We need to model interactions. In a traditional OLS paradigm, you do that by multiplying the (scaled) exogs. We can try that first. 
+
+```{r setup}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples_pm.csv") 
+```
+
+Scaling
+```{r}
+sample_data %>% select(-X1, -upfront_mip) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+date skew doesn't seem to have worked, either.
+```{r}
+scaled_data <- sample_data %>% filter(next_month_cpr > 0) %>% na.omit()
+N <- nrow(scaled_data)
+scaled_data <- scaled_data %>%
+    mutate(burnout = burnout * 5e-6,
+           hpa = hpa * 5,
+           incentive = incentive * 7.5e-4,
+           lockin = lockin * 2,
+           next_month_cpr = ((N-1)*(next_month_cpr * 1e-2)+0.5)/N,
+           scaled_wala = wala * 3e-2,
+           upfront_mip = upfront_mip * 1e-1)
+
+ scaled_data %>% select(-X1, -wala) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+
+```{r}
+library(GGally)
+
+scaled_data %>% select(-X1) %>% na.omit() %>% sample_n(size=1000) %>%
+  ggpairs(mapping = ggplot2::aes(alpha=0.01),
+          upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+There's a problem with upfront mip. Only available after 2012. I'll have to check why.
+```{r}
+scaled_data %>% mutate(origination=dt %m-% months(wala)) %>%
+  ggplot(aes(x=origination,y=upfront_mip)) + geom_point(alpha=0.1)
+```
+Maybe that's not so bad.
+
+
+How does incentive vs. cpr interact with wala?
+```{r}
+scaled_data %>% 
+  ggplot(aes(y=next_month_cpr, x=incentive)) + 
+    facet_wrap(~factor(round(wala* 1/(3e-2*36))),ncol=3) +
+    geom_point(alpha=0.05) + ggtitle("Incentive by loan age (3Y increments)")
+```
+So why don't people with higher incentives refinance? It's not just wala. What about actual burnout?
+
+```{r}
+scaled_data %>% 
+  ggplot(aes(y=next_month_cpr, x=incentive)) + 
+    facet_wrap(~factor(round(burnout)),ncol=3) +
+    geom_point(alpha=0.25) + ggtitle("Incentive by Cumulative Incentive")
+
+```
+Might be able to get somewhere with burnout or lockin.
+
+```{r}
+scaled_data %>% ggplot(aes(y=next_month_cpr, x=incentive*(lockin))) +
+  geom_point(alpha=0.05) + xlim(-10,10)
+```
+
+That looks promising. Add in mip?
+```{r}
+scaled_data %>% ggplot(aes(y=next_month_cpr, 
+                           x=(upfront_mip + incentive)*lockin)) +
+  geom_point(alpha=0.05)
+
+```
+
+Let's give it a shot.
+
+```{r}
+
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        month_intercept[month[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive * lockin
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit <- stan(model_code=stan_code, 
+            model_name="shrunk intercept,incent*lockin",
+            data=list(N=N, K=3, 
+                      exogs=scaled_data %>% 
+                        mutate(incenlock=(upfront_mip + incentive)*lockin) %>%
+                        select(incenlock, cato, hpa) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+
+Love these fast models.
+
+```{r}
+print(fit, pars=c("beta"))
+```
+
+...not what I expected to get out of this one.
+
+How can the incentive beta be negative? Relationship looks pretty clearly positive to me...
+
+Fuck it. I'll narrow the prior again.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        month_intercept[month[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(2,1); #incentive * lockin
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit2 <- stan(model_code=stan_code, 
+            model_name="shrunk intercept,incent*lockin",
+            data=list(N=N, K=3, 
+                      exogs=scaled_data %>% 
+                        mutate(incenlock=(upfront_mip + incentive)*lockin) %>%
+                        select(incenlock, cato, hpa) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+
+```
+
+
+```{r}
+print(fit2, pars=c("beta"))
+```
+
+robust to prior. Still, it's less negative than before.
+
+```{r}
+scaled_data %>% ggplot(aes(y=next_month_cpr, 
+                           x=(upfront_mip + incentive)*lockin)) +
+  geom_point(alpha=0.05) + geom_smooth()
+
+```
+
+Maybe the problem is on the far backend.
+```{r}
+scaled_data %>% ggplot(aes(y=next_month_cpr, 
+                           x=(upfront_mip + incentive))) +
+  geom_point(alpha=0.05) + geom_smooth() 
+```
+```{r}
+scaled_data %>% mutate(origination=dt %m-% months(wala)) %>% 
+   ggplot(aes(x=upfront_mip + incentive)) + 
+   facet_wrap(~factor(year(origination))) + geom_histogram(bins=50)
+```
+
+Ok. *Too-High* incentive implies a risky loan, bad credit, and thus possible inability to refinance.
+
+I need to get credit scores in here. Lockin should be a proxy for that. But I see I have it as prevailing rate over WAC. Would be more useful as WAC over original rate (i.e. rate prevailing at origination). That would make it a risk multiplier. But sensitive to rate levels. ...This is actually what SATO is supposed to measure. I didn't have it in this set b/c it uses median WAC of all pools, which I don't have before 2012. I can base it on prevailing mortgage rates instead of mean wac, so I can use it going back further.
+
+Redo this stuff with new dataset.

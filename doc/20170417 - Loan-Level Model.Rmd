@@ -1,0 +1,557 @@
+---
+title: "20170417 - Loan-Level Model"
+output: html_notebook
+---
+
+Building on the loan data I looked at in <a href="doc/20170414 - Loan-level data.Rmd">the previous notebook</a>, let's try a bernoulli model. Absent other information, p(prepay) is only 0.013, so I might need some extra tricks to get a decent signal.
+
+```{r, message=FALSE, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/loans2.csv") 
+```
+
+I want to use:
+  * burnout
+  * cato
+  * sato
+  * credit_score
+  * hpa
+  * incentive
+  * lockin
+  * months prepaid
+  * first_time
+  * refinance_type (if any)
+  * seasonality (winter/summer)
+  * total debt/expense ratio
+  * original_principal_balance
+  
+We can do partial pooling by issuer, but that's a lot of pools. Should also check vintage.
+
+Turn factors into factors and booleans into booleans.
+```{r make_factors}
+sample_data <- sample_data %>% 
+  mutate(first_time=as.logical(first_time), 
+         refinance_type=factor(refinance_type), 
+         agency=as.logical(agency), 
+         buy_down_status=as.logical(buy_down_status),
+         down_payment_assistance=as.logical(down_payment_assistance), 
+         agency=factor(agency), loan_purpose=factor(loan_purpose),
+         origination_type=factor(origination_type))
+```
+
+Need scaling for the continuous variables.
+```{r}
+sample_data %>% select(prepaid, burnout, cato, sato, credit_score, hpa, incentive, lockin, months_prepaid, 
+                       seasonality, total_debt_expense_ratio, original_principal_balance) %>%
+  gather(beta, value) %>% drop_na() %>% ggplot(aes(x=value)) + facet_wrap(~beta, scales = "free") + geom_density()
+```
+
+Not too much needed here. Should center credit_score. These guys are relatively risky, it seems. Modal score around 675.
+```{r, fig.width=10}
+scaled_data <- sample_data %>% mutate(hpa=hpa*10, cato=cato*2, lockin=lockin*2, credit_score=(credit_score-675)/50,
+                                      total_debt_expense_ratio=(total_debt_expense_ratio-4000)/500,
+                                      summer = ifelse(seasonality >= 5 & seasonality <= 8, 1,0),
+                                      opb=(log(original_principal_balance)-16.5)*2)
+
+scaled_data %>% select(prepaid, burnout, cato, sato, credit_score, hpa, 
+                       incentive, lockin, months_prepaid, 
+                       summer, total_debt_expense_ratio, opb) %>%
+  gather(beta, value) %>% drop_na() %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, scales = "free") + geom_density()
+```
+
+I'm going to fit this without vintage pooling at first, but with missing data, which is tricky.
+
+# Missing Data
+I need to impute missing data with a reasonable prior.
+The only missing data is credit scores (17%) and total_debt_expense_ratio (54%). TDER is pretty gaussian, but credit_score is closer to lognormal. 
+
+Moreover, credit_score is really truncated data. Anything way < 300 or > 850 was disclosed as blank. This is something of a PITA. In my transformed data set, 300 becomes -7.5, and 850 becomes 3.5. What are the odds that anybody with a credit score > 850 was getting a GNM II Loan? I don't know.
+
+I'll have to look at the other data in missing credit score records, see if there's clear bimodality.
+
+I'm leaning towards separate multiple imputation rather than a joint model, as we'd be adding some 70,000-odd parameters to the current 9 in which we are really interested, and we really need to estimate normalized credit_score separately from TDER. 
+
+## Credit Score
+
+Does a PCA suggest that blank credit scores form more than one cohort? I.e., is there an easily identifiable "too-high" group compared to "too-low" credit scores?
+
+Keep in mind, PCA is extremely scale-sensitive.
+
+I could, actually, run the whole model as supervised random forest, but I think the signal is too weak. A given loan can often have a propensity to prepay, but never actually do it. I need strong priors.
+
+```{r}
+missing_cs <- scaled_data %>% filter(is.na(credit_score)) %>%
+  select(-dsn, -as_of_date, -maturity_date, -origination_date, -summer, -seasonality,
+         -seller_issuer_id, -pool_cusip, -credit_score, -state,-refinance_type,
+         -agency,-loan_purpose,-ltv,-original_loan_term, -origination_type,
+         -property_type, -original_principal_balance, -remaining_loan_term,
+         -total_debt_expense_ratio, -upb_at_issuance, -issuer_id, -loan_age) %>%
+  mutate(upb=log(upb), annual_mip=annual_mip/10000, upfront_mip=upfront_mip/10000,
+         loan_gross_margin=loan_gross_margin/10000) %>%
+  drop_na()
+  
+cs_pca <- prcomp(missing_cs %>% mutate_all(scale))
+cs_pca$x %>% as_tibble %>% ggplot(aes(y=PC1, x=PC2)) + geom_point(alpha=0.1)
+```
+
+No real outliers. Conceivably the higher PC1s are a separate group.
+```{r}
+missing_cs[which(cs_pca$x[,1]>5),]
+```
+Lockin is on the high end for these guys. That *could* pertain to a low credit score. But I don't see how it would do so for a high credit score.
+
+I can't see any distinct group for credit score, and my guess would be that people with inordinately good credit scores don't get GNM II loans. 
+
+I'll set missing credit scores to 300.
+```{r}
+scaled_data <- scaled_data %>% replace_na(replace=list(credit_score=(300-675)/50))
+```
+
+## Total Debt-Expense Ratio (TDER)
+
+After Aug. 2013, they no longer report values of < 10% or > 65%. It should be possible to impute missing values to at least the right ballpark as a result, but we only have GNM II from Oct. 2013 and onward.
+
+```{r}
+sample_data %>% ggplot(aes(x=total_debt_expense_ratio)) + 
+  geom_histogram(bins = 50)
+```
+
+From the look of the distribution of available ratios, there shouldn't be a big population on either side, but over half the loans have NAs for this.
+
+As with credit score, can we distinguish tails?
+
+```{r}
+missing_tder <- scaled_data %>% filter(is.na(total_debt_expense_ratio)) %>%
+  select(-dsn, -as_of_date, -maturity_date, -origination_date, -summer, -seasonality,
+         -seller_issuer_id, -pool_cusip, -credit_score, -state,-refinance_type,
+         -agency,-loan_purpose,-ltv,-original_loan_term, -origination_type,
+         -property_type, -original_principal_balance, -remaining_loan_term,
+         -total_debt_expense_ratio, -upb_at_issuance, -issuer_id, -loan_age,
+         -removal_reason) %>%
+  mutate(upb=log(upb), annual_mip=annual_mip/10000, upfront_mip=upfront_mip/10000,
+         loan_gross_margin=loan_gross_margin/10000) %>%
+  drop_na()
+  
+tder_pca <- prcomp(missing_tder %>% mutate_all(scale))
+tder_pca$x %>% as_tibble %>% ggplot(aes(y=PC1, x=PC2)) + geom_point(alpha=0.1)
+```
+Hm. It's not clear what's going on from the weightings (`tder_pca$rotation[,2]`)
+
+How do the low PC1s look?
+```{r}
+missing_tder[which(tder_pca$x[,1] < -5),]
+```
+
+I think I'm going to have to drop this one.
+
+## Other
+```{r}
+scaled_data %>% select(burnout, cato, sato, credit_score, hpa, 
+                            incentive, lockin, months_prepaid, 
+                            opb, summer, prepaid) %>%
+  summarize_all(funs(sum(is.na(.)))) %>% t()
+  
+```
+
+No others.
+
+# The Model
+
+```{r}
+stan_code <- "data {
+  int<lower=1> N; #number of observations
+  int<lower=1> K; #number of factors
+# int<lower=0> vintage_index[N]; #what vintage is the record
+  matrix[N,K] exog; 
+  int<lower=0,upper=1> summer[N];
+  int<lower=0,upper=1> prepaid[N];
+}
+parameters {
+  real alpha;
+  real alpha_summer;
+  vector[K] beta;
+}
+transformed parameters {
+  real xb[N];
+  for(n in 1:N)
+    xb[n] = alpha+alpha_summer*summer[n] + exog[n]*beta;
+}
+model {
+  alpha ~ normal(0,5);
+  alpha_summer ~ normal(0,5);
+  to_vector(beta) ~ normal(0,5);
+
+  for(n in 1:N)
+    prepaid[n] ~ bernoulli_logit(xb[n]);
+}
+"
+fit <- stan(model_name="unpooled_loanlevel", model_code=stan_code, iter=1000, chains = 4,
+            data=list(N=nrow(sample_data),  K=9, 
+                      exog=scaled_data %>% select(burnout, cato, sato, credit_score, hpa, 
+                                                  incentive, lockin, months_prepaid, 
+                                                  opb) %>% as.matrix(),
+                       summer=scaled_data$summer, prepaid=sample_data$prepaid),
+            pars="xb", include=F)
+
+#128 - precalc xb, then loop in model
+#153 - precalc xb, vectorize model
+#128 - just loop in model
+#forever    - precalc xb, generated quantities
+```
+
+Not too bad. I'm betting 5000 iterations is overkill, and I could probably do 1M observations at 500 iterations. We'll see what it looks like once I put partial pooling in.
+
+How's it look?
+```{r}
+shinystan::launch_shinystan(fit)
+```
+Well mixed very early.
+
+Here's the betas:
+```{r}
+library(bayesplot)
+bayesplot::mcmc_intervals(as.array(fit),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+```
+1. burnout           
+2. cato              
+3. sato              
+4. credit_score      
+5. hpa               
+6. incentive         
+7. lockin            
+8. months_prepaid    
+9. opb               
+
+I have the usual inv_logit problem where `incentive` would be mildly positive after transformation, but in this formulation it's still negative at the margin.
+
+Does a much smaller sample look similar?
+```{r}
+N = 10000
+fit2 <- stan(model_name="unpooled_loanlevel", model_code=stan_code, 
+             iter=1000, chains = 4,
+            data=list(N=N,  K=9, 
+                      exog=(scaled_data %>% select(burnout, cato, sato,
+                                                  credit_score, hpa, 
+                                                  incentive, lockin,
+                                                  months_prepaid, opb) %>%
+                        as.matrix())[1:N,],
+                       summer=scaled_data$summer[1:N],
+                       prepaid=sample_data$prepaid[1:N]), pars="xb",
+            include=F)
+```
+
+```{r}
+bayesplot::mcmc_intervals(as.array(fit2),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+```
+
+Yeah, pretty close. Tight priors?
+
+```{r}
+stan_code <- "data {
+  int<lower=1> N; #number of observations
+  int<lower=1> K; #number of factors
+# int<lower=0> vintage_index[N]; #what vintage is the record
+  matrix[N,K] exog; 
+  int<lower=0,upper=1> summer[N];
+  int<lower=0,upper=1> prepaid[N];
+}
+parameters {
+  real alpha;
+  real alpha_summer;
+  vector[K] beta;
+}
+transformed parameters {
+  real xb[N];
+  for(n in 1:N)
+    xb[n] = alpha+alpha_summer*summer[n] + exog[n]*beta;
+}
+model {
+  alpha ~ normal(-4,1);
+  alpha_summer ~ normal(0,5);
+  beta[1] ~ normal(0,1); #burnout
+  beta[2] ~ normal(0,1); #cato
+  beta[3] ~ normal(0,1); #sato
+  beta[4] ~ normal(0,1); #credit_score
+  beta[5] ~ normal(0,1); #hpa
+  beta[6] ~ normal(1,0.1); #incentive
+  beta[7] ~ normal(0,1); #lockin
+  beta[8] ~ normal(0,1); #months_prepaid
+  beta[9] ~ normal(0,1); #opb
+
+  for(n in 1:N)
+    prepaid[n] ~ bernoulli_logit(xb[n]);
+}
+"
+N = 10000
+fit2 <- stan(model_name="unpooled_loanlevel", model_code=stan_code, 
+             iter=1000, chains = 4,
+            data=list(N=N,  K=9, 
+                      exog=(scaled_data %>% select(burnout, cato, sato,
+                                                  credit_score, hpa, 
+                                                  incentive, lockin,
+                                                  months_prepaid, opb) %>%
+                        as.matrix())[1:N,],
+                       summer=scaled_data$summer[1:N],
+                       prepaid=sample_data$prepaid[1:N]), pars="xb",
+            include=F)
+bayesplot::mcmc_intervals(as.array(fit2),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+```
+That worked. Tells me these are weakly identified, though. Wonder if I could recover fake data? Also might have to look at collinearity.
+
+## Recover Fake Parameters
+
+inv_logit: $p'=\frac{exp(y)}{(1+exp(y))}$
+
+```{r fake_data}
+library(purrr)
+inv_logit <- function(x) {
+  return(1 / (1+exp(-x)))
+}
+
+N = 10000
+alpha = -5
+alpha_summer = 0.5
+beta = c(1,-1,5)
+exogs = matrix(rnorm(N*3), ncol = 3)
+summer = as.numeric(rbernoulli(N,p=0.25))
+xb <- alpha + alpha_summer*summer + exogs %*% beta
+endos = as.numeric(sapply(inv_logit(xb), rbernoulli, n=1))
+plot(endos)
+```
+
+```{r fake_fit}
+stan_code <- "data {
+  int<lower=1> N; #number of observations
+  int<lower=1> K; #number of factors
+# int<lower=0> vintage_index[N]; #what vintage is the record
+  matrix[N,K] exog; 
+  int<lower=0,upper=1> summer[N];
+  int<lower=0,upper=1> prepaid[N];
+}
+parameters {
+  real alpha;
+  real alpha_summer;
+  vector[K] beta;
+}
+transformed parameters {
+  real xb[N];
+  for(n in 1:N)
+    xb[n] = alpha+alpha_summer*summer[n] + exog[n]*beta;
+}
+model {
+  alpha ~ normal(0,10);
+  alpha_summer ~ normal(0,5);
+  to_vector(beta) ~ normal(0,5); 
+
+  for(n in 1:N)
+    prepaid[n] ~ bernoulli_logit(xb[n]);
+}
+"
+
+fit_fake <- stan(model_name="unpooled_loanlevel", model_code=stan_code, 
+             iter=1000, chains = 4,
+            data=list(N=N,  K=3, exog=exogs, summer=summer,
+                       prepaid=endos), pars="xb",
+            include=F)
+bayesplot::mcmc_intervals(as.array(fit_fake),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+
+```
+
+Good. I am not taking crazy pills.
+
+## Collinearity?
+
+```{r}
+library(GGally)
+scaled_data %>% select(burnout, cato, sato, credit_score, 
+                       hpa,  incentive, lockin, months_prepaid, opb) %>%
+  ggcorr()
+```
+
+Ok, kill `lockin` and `sato`.
+
+# Model 2
+Let's do some ground work to compare priors
+```{r}
+library(loo)
+loos <- list()
+```
+
+```{r}
+stan_code <- "data {
+  int<lower=1> N; #number of observations
+  int<lower=1> K; #number of factors
+# int<lower=0> vintage_index[N]; #what vintage is the record
+  matrix[N,K] exog; 
+  int<lower=0,upper=1> summer[N];
+  int<lower=0,upper=1> prepaid[N];
+  matrix[K,2] prior_B; #individual beta priors
+}
+parameters {
+  real alpha;
+  real alpha_summer;
+  vector[K] beta;
+}
+transformed parameters {
+  real xb[N];
+  for(n in 1:N)
+    xb[n] = alpha+alpha_summer*summer[n] + exog[n]*beta;
+}
+model {
+  alpha ~ normal(-4,5);
+  alpha_summer ~ normal(1,2);
+  for(k in 1:K)
+    beta[k] ~ normal(prior_B[k,1],prior_B[k,2]);
+
+  for(n in 1:N)
+    prepaid[n] ~ bernoulli_logit(xb[n]);
+}
+generated quantities {
+  real log_lik[N];
+  for(n in 1:N)
+    log_lik[n] = bernoulli_logit_lpmf(prepaid[n]|xb[n]);
+}
+"
+N = 10000
+prior_B = rbind(burnout=        c(-3,0.5),
+                cato=            c(0,1),
+                credit_score=    c(0,1),
+                hpa=             c(0,1),
+                incentive=       c(3,0.5),
+                months_prepaid=  c(-1,2),
+                opb=             c(0,1))
+loo_nm <- paste(apply(prior_B,1,paste,collapse=","),collapse="|") 
+fit2 <- stan(model_name="unpooled_loanlevel", model_code=stan_code, 
+             iter=1000, chains = 4,
+            data=list(N=N,  K=7, 
+                      exog=(scaled_data %>% select(burnout, cato, 
+                                                  credit_score, hpa, 
+                                                  incentive, 
+                                                  months_prepaid, opb) %>%
+                        as.matrix())[1:N,],
+                       prior_B=prior_B,
+                       summer=scaled_data$summer[1:N],
+                       prepaid=sample_data$prepaid[1:N]), pars="xb",
+            include=F)
+
+loos[[loo_nm]] <- loo::loo(loo::extract_log_lik(fit2))
+bayesplot::mcmc_intervals(as.array(fit2),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+
+```
+
+I like this set of priors better. There's a problem where `burnout` and `incentive` are highly correlated and have explicit directions, so strong priors help.
+
+Now, what partial pooling makes sense? There are a number of categories I could be conditioning on.
+
+# Partial Pooling Candidates
+
+## Issuer ID
+```{r}
+sample_data %>% group_by(issuer_id) %>% summarize(pct=sum(prepaid) / n(), n=n()) %>%
+  ggplot(aes(y=factor(issuer_id), x=pct, col=log(n))) + geom_point() + 
+  ggtitle("% Prepaid by Issuer")
+```
+
+Looks pretty well correlated to there not being a lot of data for the outliers.
+```{r}
+sample_data %>% group_by(issuer_id) %>% 
+  summarize(pct=sum(prepaid) / n(), n=n()) %>%
+  ggplot(aes(x=log(n), y=pct)) + geom_point()
+```
+Yup.
+
+## Vintage 
+
+I'll do this one without investigation as it's standard.
+
+```{r}
+stan_code <- "data {
+  int<lower=1> N; #number of observations
+  int<lower=1> K; #number of factors
+  int<lower=1> V; #number of vintages
+  int<lower=0> vintage_index[N]; #what vintage is the record
+  matrix[N,K] exog; 
+  int<lower=0,upper=1> summer[N];
+  int<lower=0,upper=1> prepaid[N];
+  matrix[K,2] prior_B; #individual beta priors
+}
+parameters {
+  real alpha;
+  real alpha_summer;
+  row_vector[K] beta;
+  matrix[V,K] beta_vintage;
+}
+transformed parameters {
+  real xb[N];
+  matrix[V,K] global_beta;
+  for(v in 1:V)
+    global_beta[v] = beta + beta_vintage[v];
+  for(n in 1:N)
+    xb[n] = alpha+alpha_summer*summer[n] + 
+              exog[n]*global_beta[vintage_index[n]]';
+}
+model {
+  alpha ~ normal(-4,5);
+  alpha_summer ~ normal(1,2);
+  for(k in 1:K)
+    beta[k] ~ normal(prior_B[k,1],prior_B[k,2]);
+  to_vector(beta_vintage) ~ normal(0,1);
+
+  for(n in 1:N)
+    prepaid[n] ~ bernoulli_logit(xb[n]);
+}
+generated quantities {
+  real log_lik[N];
+  for(n in 1:N)
+    log_lik[n] = bernoulli_logit_lpmf(prepaid[n]|xb[n]);
+}
+"
+N = nrow(sample_data)
+prior_B = rbind(burnout=        c(-3,0.5),
+                cato=            c(0,1),
+                credit_score=    c(0,1),
+                hpa=             c(0,1),
+                incentive=       c(3,0.5),
+                months_prepaid=  c(-1,2),
+                opb=             c(0,1))
+loo_nm <- paste(apply(prior_B,1,paste,collapse=","),collapse="|") 
+
+sample_data <- sample_data %>%
+  mutate(vintage=factor(year(origination_date)))
+V = nlevels(sample_data$vintage)
+
+fit <- stan(model_name="vintage_ll", model_code=stan_code, 
+             iter=1000, chains = 4,
+            data=list(N=N,  K=7, V=V,
+                      exog=(scaled_data %>% select(burnout, cato, 
+                                                  credit_score, hpa, 
+                                                  incentive, 
+                                                  months_prepaid, opb) %>%
+                        as.matrix())[1:N,],
+                       vintage_index=as.numeric(sample_data$vintage[1:N]),
+                       prior_B=prior_B,
+                       summer=scaled_data$summer[1:N],
+                       prepaid=sample_data$prepaid[1:N]), 
+            pars=c("xb", "global_beta"), include=F)
+
+loos[[loo_nm]] <- loo::loo(loo::extract_log_lik(fit))
+bayesplot::mcmc_intervals(as.array(fit),
+                          regex_pars=c("alpha","alpha_summer","beta"))
+
+```
+

@@ -1,0 +1,262 @@
+---
+title: "20170310 - Popova Model with Full Histories"
+output: html_notebook
+---
+
+I'm back to using CPR for endo. 
+
+Betas are:
+* incentive: WAC - prevailing mortgage rate, as before
+* spline: incentive cubed
+* burnout: WALA (can't do the more complicated burnout as I don't have all the historical data)
+* seasonality: 1 if it's the summer-time, i.e. May-August.
+* yield_curve: 10Y rate minus 2Y rate
+
+I want to use the vintage (i.e. origination year) to adjust the betas a bit, see if I can't get a positive beta for incentive (at least in some years) without constraining it.
+
+First I'll just do a shrunk intercept, then I'll try a full multi-level beta model.
+
+```{r, message=FALSE, warning=FALSE}
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/vnm_samples.csv") %>%
+  rename(dt=major, cusip=minor)
+
+sample_data <- sample_data %>% filter(endo >= 0 & incentive < 0.5)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% mutate(endo = ((N-1) * (endo * 1e-2) + 0.5)/N,
+                                      incentive = incentive * 10, 
+                                      spline = spline * 1.3e3, 
+                                      yc = yc * 0.5,
+                                      burnout=burnout * 0.33e-2)
+```
+
+How does the data look on this one?
+```{r}
+sample_data %>% sample_n(size = 1000) %>%
+  ggpairs(mapping=list(alpha=0.1), columns=c("incentive","spline","burnout", "yc","dt", "vintage","endo"),
+                        upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+
+```
+
+Burnout looks much more obvious when you see vintage ~ endo. There's a clear sweet spot.
+On this dataset, incentive would probably get a positive beta if I right-censor it, too.
+
+Anyway, stick to the plan. First pooled intercept by vintage.
+
+```{r shrunk_intercept}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real vintage_intercept[V];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        vintage_intercept[vintage[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(vintage_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(0,5); #spline
+  beta[3] ~ normal(-1,1); #burnout
+  beta[4] ~ normal(1,1); #yc
+  beta[5] ~ normal(1,5); #is_summer
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+less_data <- sample_data %>% sample_n(size=5000) %>% 
+    mutate(vintage=year(vintage) - min(year(vintage)) + 1)
+stopifnot(all(diff(sort(unique(less_data$vintage))) == 1)) #ensure we don't have any unused parameters in the fit.
+fit <- stan(model_code=stan_code, model_name="Vintage_shrunk_intercept",
+            data=list(N=nrow(less_data), K=5, V=length(unique(less_data$vintage)),
+                      exogs=less_data %>% select(incentive, spline, 
+                                                 burnout, yc, seasonality) %>%
+                            as.matrix,
+                      vintage=less_data$vintage, endo=less_data$endo),
+            iter=2000, chains=4, pars=c("phi", "shrunk_intercept"), include=FALSE)
+```
+
+```{r}
+print(fit, pars=c("beta", "intercept", "vintage_intercept", "lambda"), include=T)
+```
+It's not finding much to work with here. I'm going to re-run with censored incentive.
+
+
+```{r shrunk_intercept_censor_incentive}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real vintage_intercept[V];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        vintage_intercept[vintage[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(vintage_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(0,5); #spline
+  beta[3] ~ normal(-1,1); #burnout
+  beta[4] ~ normal(1,1); #yc
+  beta[5] ~ normal(1,5); #is_summer
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+N <- nrow(less_data)
+censored_data <- less_data %>% 
+  mutate(incentive=sapply(incentive, function(x){min(0.35,x)}))
+fit <-  stan(model_code=stan_code, model_name="Vintage_shrunk_intercept",
+            data=list(N=N, K=5, V=length(unique(less_data$vintage)),
+                      exogs=censored_data %>% select(incentive, spline,
+                                                     burnout, yc, seasonality) %>%
+                            as.matrix,
+                      vintage=censored_data$vintage, endo=censored_data$endo),
+            iter=2000, chains=4, pars=c("phi", "shrunk_intercept"), include=FALSE)
+```
+
+```{r}
+print(fit, pars=c("beta", "intercept", "vintage_intercept", "lambda"), include=T)
+```
+
+Didn't help. On to shrunk betas.
+```{r shrunk_beta}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[V,K] vintage_beta;
+    real intercept;
+    real vintage_intercept[V];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                vintage_intercept[vintage[n]] +
+                (beta + vintage_beta[vintage[n]]) * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(vintage_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,1); #incentive
+  beta[2] ~ normal(0,5); #spline
+  beta[3] ~ normal(-1,1); #burnout
+  beta[4] ~ normal(1,1); #yc
+  beta[5] ~ normal(1,5); #is_summer
+  to_vector(vintage_beta) ~ normal(0,1);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+N <- nrow(less_data)
+fit2 <-  stan(model_code=stan_code, model_name="Vintage_shrunk_beta",
+            data=list(N=N, K=5, V=length(unique(less_data$vintage)),
+                      exogs=less_data %>% select(incentive, spline,
+                                                     burnout, yc, seasonality) %>%
+                            as.matrix,
+                      vintage=less_data$vintage, endo=less_data$endo),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+Surprisingly fast.
+
+```{r}
+print(fit2, pars = c("beta","vintage_beta","intercept","vintage_intercept"))
+```
+
+Too much to look at. I'm mainly interested in what it did to incentive over time.
+
+```{r}
+vintage_beta <- extract(fit2,pars=c("vintage_beta"))[["vintage_beta"]]
+vintage_beta <- apply(vintage_beta,c(2,3),median)
+dimnames(vintage_beta) <- list(1985+seq.int(nrow(vintage_beta)),
+                               c("incentive","spline","burnout","yc","season"))
+vintage_beta <- as.data.frame(cbind(vintage=as.numeric(rownames(vintage_beta)),vintage_beta))
+
+global_beta <- apply(extract(fit2, pars=c("beta"))[["beta"]],2,median)
+global_beta <- data.frame(global_beta,beta=colnames(vintage_beta)[-1])
+
+vintage_beta %>% gather(beta,value,-vintage) %>% 
+  ggplot(aes(x=vintage,y=value, col=beta)) + geom_line() + 
+    geom_hline(data=global_beta, mapping=aes(yintercept=global_beta,col=beta)) +
+    ggtitle("Betas by Vintage (global beta as line)")
+```
+
+So here you go. Incentive is causing refinancing for younger loans. Otherwise it seems to have a negative effect, especially directly after the crisis.
+
+Your base problem is that *incentive* and *home price appreciation* are highly correlated in the period for which we have the greater mass of data. Additionally, you have *burnout*, i.e. the fact that nobody refinances in the first 30 months or so; again, this is still more significant when the preponderance of data we're using to estimate is from the later period. 
+
+It's not working to estimate the effects as if they are independent. Here, I suppose, is where the literature starts talking about *turnover* versus *incentive* models. 
+
+So, how to incorporate these effects? We need to model interactions. In a traditional OLS paradigm, you do that by multiplying the (scaled) exogs. We can try that first. Warrants a new notebook.

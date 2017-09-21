@@ -1,0 +1,15 @@
+<h1 id="prepayments-modeling-journal">Prepayments Modeling Journal</h1>
+<p>Text-only attempt to keep track of what I'm doing on this.</p>
+<h2 id="section">2017-01-18</h2>
+<p>Steve got back to me that they're primarily interested in 30Y Ginnie Mae II MBS prepayment risk. Ginnie Mae II MBS can have varying coupon rates and multiple issuers. Both Ginnie Mae I and II tend to have more prepayment risk than Freddie Mac pools b/c they are expeected to have high LTV and mandatory mortgage insurance which make refinancing attractive.</p>
+<p>Ginnie Mae started giving loan-level data only in late 2013. Before then, we have pool-level data. I'll need a way to combine the two. I could also consider using Freddie Mac loan-level data for the earlier period, and comparing FM to GM since 2013.</p>
+<p>I also need home price appreciation data. Steve recommended a set of state-level median home prices data. He was talking about series with tickers like <code>MTMHOHIO Index</code>, but I think <em>Existing</em> home sales, <code>MEHPOHIO Index</code> would be more appropriate. Home price appreciation affects LTV, and hence propensity to refinance, especially when you have mortgage insurance (i.e. LTV falls below 80%).</p>
+<h3 id="to-do-on-the-data">To do on the data:</h3>
+<pre><code>-0. Get the GM loan level data as far back as possible-
+1. Get the GM pool data as far back as possible
+  a. Get the Freddie Mac loan level data?
+2. Get the Home price appreciation data
+3. Write parsers for the data</code></pre>
+<h3 id="the-model">The model</h3>
+<pre><code>http://www.beyondbond.com/pdf/2.pdf and http://www.investinginbonds.com/assets/files/JP_Morgan_Prepayment_Model.pdf seem to be multiplicative models. The first link calls it&#39;s model &#39;multiplicative splines&#39;. In the first link, CPR is regressed against 7 factors, each of which has some kind of polynomial fit applied to it. I guess they say they&#39;re multiplying them b/c they mention they actually want CPR in log space. So we&#39;re back to standard additive model design in log space.
+I don&#39;t really have much more to say on this until I have the data nicely formatted and I can look at some graphs.</code></pre>

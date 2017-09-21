@@ -1,0 +1,165 @@
+---
+title: "Bigger Dataset distributions"
+output: html_notebook
+---
+
+I have 10,000 records plus endogenous data saved to disk now. Let's take a look in R since it's faster and easier to plot stuff.
+```{r}
+library(tidyverse)
+setwd("~/src/LondonMirror/Prepayments/")
+sample_data = read_csv("data/samples.csv")
+sample_data
+```
+
+
+
+```{r}
+colnames(sample_data)[c(2,3)] = c("pool_number", "as_of_date")
+sample_data <- sample_data[,-1]
+```
+
+```{r}
+sample_data %>% gather(variable, value, -pool_number, -as_of_date) %>%
+          ggplot(aes(x=value)) + facet_wrap(~variable, scales = "free") +
+          geom_histogram(bins=200)
+```
+
+
+* `cato` is bimodal. 
+* did we really, in 10000 samples, not get a single as_of_date in Jan, Feb, or July? What's the betting this is due to consistent missing data in those months?
+* What's going on with `next_month_cpr` (endo)?
+
+
+```{r}
+sample_data %>% ggplot(aes(x=next_month_cpr)) + geom_histogram(bins=200)
+```
+
+...lots of zeroes.
+
+```{r}
+head(sort(sample_data$next_month_cpr),15)
+```
+
+how did that happen?
+
+```{r}
+head(sample_data[order(sample_data$next_month_cpr),],5)
+```
+
+I think I'd better take the negatives out.
+
+```{r}
+sample_data <- sample_data %>% filter(next_month_cpr >= 0)
+sample_data
+```
+
+That was a further 8% that had negative CPRs. Hmm.
+```{r}
+sample_data %>% ggplot(aes(x=next_month_cpr)) + geom_histogram(bins=200)
+```
+
+Otherwise seems appropriately bounded. I can tell right now that I'm going to have difficulty estimating much over about 10%, though.
+
+# Seasonality
+What's with the missing months? Is seasonality calculated correctly?
+```{r}
+sample_data %>% ggplot(aes(x=as.POSIXlt(as_of_date)$mon+1,               
+                           y=seasonality)) + 
+  geom_jitter(alpha=0.1) + ggtitle("As of Date vs Seasonality")
+                
+```
+
+Maybe it's just an error in the graph rendering
+
+```{r}
+sample_data %>% ggplot(aes(x=seasonality)) + geom_histogram(bins=12)
+```
+
+guess so.
+
+Let's put in the scalars I chose before and re-check the distributions
+```{r}
+scaled_data <- sample_data %>% mutate(burnout = burnout * 1e-7, 
+                                      cato = cato * 0.1, 
+                                      next_month_cpr = next_month_cpr * 1e-2,
+                                      incentive = incentive * 5e-5, 
+                                      lockin = lockin * 200, 
+                                      sato = sato * 1e-4, 
+                                      upfront_mip = upfront_mip * 0.01)
+scaled_data %>% gather(variable, value, -pool_number, -as_of_date) %>%
+          ggplot(aes(x=value)) + facet_wrap(~variable, scales = "free") +
+          geom_histogram(bins=200)
+```
+
+Anything else missing?
+
+```{r}
+apply(scaled_data,2,function(X){sum(is.na(X))})
+```
+Yes, and cato should never be missing. Fixed that for future versions; I just needed a longer data history.
+
+Ok. Let's try to fit my first stab at the model on this.
+```{r}
+scaled_data <- na.omit(scaled_data)
+```
+
+```{r, message=TRUE, warning=TRUE}
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+N = 5000
+stan_code = readLines(file("/home/charles/src/LondonMirror/Prepayments/prepayments/stan/pool.stan"))
+attach(scaled_data)
+fit <- stan(model_code=stan_code, model_name="normal pool",
+            data=list(N=N, cpr=next_month_cpr[1:N], cato=cato[1:N],
+                      sato=sato[1:N], hpa=hpa[1:N], lockin=lockin[1:N],
+                      burnout=burnout[1:N], incentive=incentive[1:N],
+                    mip=upfront_mip[1:N], month=seasonality[1:N]),
+          iter=1000)
+detach()
+```
+```{r}
+options(max.print=250)
+fit
+```
+
+Well-mixed on betas, ok on seasonality. `n_eff` is low, but Betancourt claims any n_eff / iterations of over 0.001 is fine.
+
+Also, it seems I can't hard-constrain the endo to positive.
+
+Let's do a sanity check on the betas.
+
+What effects are largest?
+
+I would hope incentive is the most important.
+```{r}
+params <- rstan::extract(fit, pars=c("season", "alpha", "beta", "sigma"))
+params <- do.call("cbind",params)
+colnames(params) <- c(paste0("season",1:12), "alpha", 
+                                 "cato","sato","hpa","lockin","burnout",
+                                 "incentive", "mip", "sigma")
+effects <- array(dim=c(nrow(params), N, ncol(params)), 
+                 dimnames=list(iteration=seq.int(nrow(params)),
+                               pool=scaled_data$pool_number[1:N],
+                               element=colnames(params)))
+beta_order = sapply(colnames(params)[14:(ncol(params)-1)], grep,
+                    x=colnames(sample_data))
+for(n in 1:N) {
+  tmp_seasons <- rep(0,12)
+  tmp_seasons[scaled_data[n,"seasonality"][[1]]] <- 1
+  for(i in 1:2000) {
+    effects[i,n,] <- c(tmp_seasons * params[i,1:12], params[i,13],
+                         params[i,14:(ncol(params)-1)] * 
+                         unlist(scaled_data[n,beta_order]),
+                       params[i,ncol(params)])
+  }
+}
+save.image()
+```
+
+```{r}
+effect_median <- apply(effects, 3, median)
+effect_median
+```
+
+Weak effects compared to the baseline ($\alpha$), and the sum of effects is lower than $\sigma$. Let's try a proper logit model.

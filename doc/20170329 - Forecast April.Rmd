@@ -1,0 +1,172 @@
+---
+title: "20170329 - Prepayments by vintage, coupon, issuer"
+output: html_notebook
+---
+
+
+
+```{r}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+library(ggthemes)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+cpr <- read_csv("/data/prepayments/gnm_ii_pool_recent_cprs.csv") %>%
+      rename(Date=X1) %>% gather(cusip,value,-Date)
+pool_info <- read_csv("/data/prepayments/gnm_ii_pool_info.csv") %>%
+      select(-X1)
+x <- left_join(cpr, pool_info)
+x <- x %>% mutate(vintage=year(pool_issue_date), value=as.numeric(value))
+```
+
+Average CPR by Vintage, Coupon, and issuer as in Barclay's Prepayment Outlook reports.
+```{r}
+x_summary <- x %>% na.omit %>% mutate(coupon = security_interest_rate / 1000) %>%
+      group_by(coupon, vintage, Date) %>%
+      filter(Date == as.Date("2017-02-01") & vintage > 2003) %>%
+      filter(coupon %in% c(3,3.5,4,4.5,5,5.5)) %>%
+      summarize(WAC=round(mean(wac/1000),2), 
+                `Balance ($B)`=round(sum(pool_upb)/1e9, digits=1), 
+                CPR=round(mean(value)*100,1)) %>%
+      select(-Date) %>% rename(Coupon=coupon, Vintage=vintage)
+print(x_summary)
+```
+
+These don't look much like the ones Barclays has. How about 3M CPR?
+```{r}
+cpr <-  read_csv("/data/prepayments/gnm_ii_pool_recent_cprs.csv") %>% rename(Date=X1)
+cpr <- cpr[,!is.na(cpr[6,])[1,]]
+cpr_3m <- apply(cpr[4:6,-1],2,function(x) {mean(na.omit(x))})
+```
+
+I also need to predict next month. I guess I should get the March data for every single GNM II Pool I know about.
+
+```{r load_march_data}
+mar_data <- read_csv("/data/prepayments/201703 gnm_ii_data.csv") %>%
+            rename(cusip=index) %>% select(-X1)
+mar_data
+```
+
+Scaling
+
+```{r}
+mar_data <- mar_data %>% mutate(burnout = burnout * 5e-6, 
+                                      cato = cato * 1, 
+                                      incentive = incentive * 5e-4, 
+                                      lockin = lockin * 200, 
+                                      sato = sato * 1, 
+                                      hpa = hpa * 5,
+                                      upfront_mip = upfront_mip * 0.01)
+```
+
+Let's have a look
+
+```{r}
+mar_data %>% select(-wala, -cusip, -lockin) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+
+```
+
+HPA is messed up.
+
+Median betas for point estimate:
+```{r}
+vb_betas <- p_vb$data %>% select(mid,beta,vintage) %>% spread(beta,mid)
+global_betas <- extract(fit_phv, pars=c("beta"))[["beta"]]
+colnames(global_betas) <- beta_labels
+global_betas <- apply(global_betas,2,median)
+intercept <- median(extract(fit_phv, pars=c("intercept"))[["intercept"]])
+theta <- median(extract(fit_phv, pars=c("theta"))[["theta"]])
+month_intercept <- apply(extract(fit_phv, 
+                                 pars=c("month_intercept"))[["month_intercept"]],
+                         2,median)
+model_params = list(global_betas=global_betas, vb_betas=vb_betas, intercept=intercept,
+                    month_intercept=month_intercept)
+```
+
+Estimate function (this is before multiplying by odds it's zero):
+```{r}
+cpr_hat <- function(x, model_params) {
+  season = month(x$dt)
+  p_betas = with(model_params,
+                 global_betas + vb_betas[vb_betas$vintage == x$vintage,-1])
+  p_alpha = with(model_params, intercept + month_intercept[season])
+  ans <- sum(x[names(p_betas)] * p_betas)
+  return(exp(ans + p_alpha))
+}
+```
+
+Ok, how do these look?
+
+```{r}
+library(lubridate)
+mar_data <- mar_data %>% mutate(vintage= year(dt %m-% months(wala)))
+mar_hat = c()
+for(i in seq.int(nrow(mar_data))) {
+  mar_hat[i] <- cpr_hat(x=mar_data[i,], model_params=model_params)
+}
+```
+
+```{r}
+mar_data$cpr_hat <- mar_hat
+rm(mar_hat)
+```
+
+```{r}
+mar_data %>% ggplot(aes(x=(1-theta)*cpr_hat)) + geom_histogram(bins=50)
+```
+
+```{r}
+mar_data$cpr_3m <- cpr_3m[mar_data$cusip]
+
+coupons <- pool_info$security_interest_rate / 1000
+names(coupons) <- pool_info$cusip
+mar_data$coupon <- coupons[mar_data$cusip]
+rm(coupons)
+
+wacs <- pool_info$wac / 1000
+names(wacs) <- pool_info$cusip
+mar_data$wac <- wacs[mar_data$cusip]
+rm(wacs)
+
+upbs <- pool_info$pool_upb
+names(upbs) <- pool_info$cusip
+mar_data$upb <- upbs[mar_data$cusip]
+rm(upbs)
+```
+
+```{r}
+mar_summary <- mar_data %>%  group_by(coupon, vintage) %>%
+      filter(vintage > 2003) %>% filter(coupon %in% c(3,3.5,4,4.5,5,5.5)) %>%
+      summarize(WAC=round(mean(wac),2), 
+                `Balance ($B)`=round(sum(upb)/1e9, digits=1), 
+                `3M CPR`=round(mean(cpr_3m)*100,1),
+                `April CPR`=round(mean(cpr_hat),1),
+                `April CPR w/0s`=round(mean((1-theta)*cpr_hat),1)) %>%
+      rename(Coupon=coupon, Vintage=vintage)
+print(mar_summary)
+```
+
+```{r}
+mar_summary %>% select(Coupon, Vintage, `3M CPR`, `April CPR`, 
+                       `April CPR w/0s`) %>% gather(CPR_type,CPR, -Coupon, -Vintage) %>%
+  ggplot(aes(x=CPR, col=CPR_type, y=Vintage)) + facet_wrap(~Coupon) + 
+    geom_point(shape="|", size=2)
+```
+
+Definitely need the 0s in there, even though that seems to underestimate prepayments based on previous 3 months. Maybe I should through `prev_3m_cpr` in as a factor in a future version. Difficult on a pool-level, though. Does everyone else only fit on aggregate endos?
+
+Anyway, something for Steve should include that table, I guess, and maybe a version of the graph above.
+
+Why am I missing some 3M CPRs? At this point I think I'd better just fill those in manually.
+
+I'm going to make the table in Excel to save some time.
+
+What's the standard deviation of pool-level mean forecasts by year and vintage?

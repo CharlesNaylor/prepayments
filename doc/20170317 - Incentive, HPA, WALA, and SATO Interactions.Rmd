@@ -1,0 +1,474 @@
+---
+title: "20170316 - Incentive, HPA, WALA, and Vintage Interactions"
+output: html_notebook
+---
+
+I've re-done SATO so that it works with the old-date sampler. Let's see if we can't get an interaction between incentive and SATO to explain the multi-modality in the incentive distribution.
+
+Also, Vintage effects are noted in the literature, reflecting evolving underwriting standards. Is there a way to model this as a Gaussian process?
+```{r setup}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/samples2.csv") %>%
+  select(-X1,-level_1) %>% rename(cusip=level_0)
+```
+
+Scaling
+```{r}
+sample_data %>% select(-cusip) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+`lockin`, and `incentive` have similar multi-modal distributions.
+
+```{r}
+library(GGally)
+ggpairs(sample_data, columns=c("incentive","sato","lockin","next_month_cpr"))
+```
+
+Well, there doesn't seem to be much point to including lockin. On to scaling.
+
+```{r}
+scaled_data <- sample_data %>% filter(next_month_cpr > 0) %>% na.omit()
+N <- nrow(scaled_data)
+scaled_data <- scaled_data %>%
+    mutate(burnout = burnout * 5e-6,
+           hpa = hpa * 5,
+           incentive = incentive * 7.5e-4,
+           lockin = lockin * 2,
+           next_month_cpr = ((N-1)*(next_month_cpr * 1e-2)+0.5)/N,
+           sato = sato * 1,
+           scaled_wala = wala * 3e-2,
+           upfront_mip = upfront_mip * 1e-1)
+
+ scaled_data %>% select(-wala, -cusip, -lockin) %>%
+  gather(beta,value) %>% ggplot(aes(x=value)) + 
+  facet_wrap(~beta, ncol=3, scales="free_x") + geom_histogram(bins=50)
+```
+
+
+```{r}
+library(GGally)
+
+scaled_data %>% select(-cusip) %>% na.omit() %>% sample_n(size=1000) %>%
+  ggpairs(mapping = ggplot2::aes(alpha=0.01),
+          upper = list(continuous = wrap("density", alpha = 0.5), combo = "box_no_facet"))
+```
+Still not clear why there's no upfront mip before 2010 or so. Maybe those pools all got refinanced.
+
+How does incentive vs. cpr interact with sato?
+```{r}
+scaled_data %>% 
+  ggplot(aes(y=next_month_cpr, x=incentive)) + 
+    facet_wrap(~factor(round(sato * 1)),ncol=3) +
+    geom_point(alpha=0.05) + ggtitle("Incentive by SATO")
+```
+First evidence that the bimodality is related to SATO. Compare 2 to 1 here, and you see higher incentives with lower CPR. 
+
+Good news! 
+
+Is this more clearly shown by SATO - CPR directly?
+```{r}
+scaled_data %>% mutate(incentato=incentive-sato) %>%
+  select(next_month_cpr,incentive,incentato) %>%
+  gather(beta,value,-next_month_cpr) %>% 
+  ggplot(aes(x=value,y=next_month_cpr, col=beta, group=beta)) + 
+  geom_point(alpha=0.04) + xlim(-5,5) + geom_smooth()
+```
+
+Now, how to model the interaction?
+
+Let's get a baseline. If this has a negative beta on incentive, I think it's clear there's something wrong with my understanding of a beta regression.
+```{r}
+
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        month_intercept[month[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(-1,1); #sato
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit <- stan(model_code=stan_code, 
+            model_name="shrunk intercept,incent+mip,sato",
+            data=list(N=N, K=4, 
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = incentive+upfront_mip) %>%
+                        select(incentmip, cato, hpa, sato) %>% as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+
+Love these fast models.
+
+```{r}
+print(fit, pars=c("beta"))
+```
+
+...not what I expected to get out of this one.
+
+How can the incentive beta be negative? Relationship looks pretty clearly positive to me. And SATO is a strong positive? WTF?
+
+How do you get that answer from this:
+```{r}
+scaled_data %>% mutate(incentmip = incentive+upfront_mip) %>%
+  select(next_month_cpr,incentmip,sato) %>% gather(beta,value,-next_month_cpr) %>%
+  ggplot(aes(x=value,y=next_month_cpr)) + facet_wrap(~beta) + geom_point(alpha=0.1)
+```
+Ok, I guess I can see it for `sato`. Negative for `incentmip` makes less sense. 
+```{r}
+scaled_data %>% mutate(incentmip = incentive+upfront_mip) %>%
+  lm(data=.,formula=next_month_cpr~incentmip)
+```
+I'm forced to say I think I have a problem with the beta regression formulation. Let's try using Phi link function instead of inv_logit again, quickly.
+
+
+```{r}
+
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int month[N]; 
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real month_intercept[12]; #seasonality
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = Phi(intercept + 
+                        month_intercept[month[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(month_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,1); #sato
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit <- stan(model_code=stan_code, 
+            model_name="shrunk intercept,incent+mip,sato",
+            data=list(N=N, K=4, 
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = (incentive+upfront_mip)-
+                               0.1*(incentive+upfront_mip)^2) %>%
+                        select(incentmip, cato, hpa, sato) %>% 
+                        as.matrix,
+                      month=scaled_data$seasonality,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+```{r}
+print(fit,pars=c("beta","intercept","month_intercept"))
+```
+Not much there, and that's with what should be a decent adjustment to make incentive work as a parabola.
+
+Maybe it's time to work on loan-level.
+
+Anyway, I can get something with a better set of betas if I shrink by vintage as well. So let's assemble all that together.
+```{r origin_hist}
+scaled_data <- scaled_data %>% mutate(origin=dt %m-% months(wala))
+ggplot(scaled_data,aes(x=origin)) + geom_histogram() + ggtitle("Origin dates")
+```
+```{r cpr_by_vintage}
+scaled_data <- scaled_data %>% mutate(vintage=year(origin) - min(year(origin))+1)
+ggplot(scaled_data,aes(x=factor(vintage),y=next_month_cpr)) + 
+  geom_boxplot() + ggtitle("CPR by Vintage")
+```
+
+# Vintage shrinkage
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[V,K] vintage_beta;
+    real intercept;
+    real vintage_intercept[V];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = Phi(intercept + 
+                vintage_intercept[vintage[n]] +
+                (beta + vintage_beta[vintage[n]]) * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(vintage_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,1); #sato
+  beta[5] ~ normal(1,5); #is_summer
+  to_vector(vintage_beta) ~ normal(0,1);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit <- stan(model_code=stan_code, 
+            model_name="shrunk vintage,parabolic incent+mip,sato",
+            data=list(N=N, K=5, V=length(unique(scaled_data$vintage)),
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = (incentive+upfront_mip)-
+                               0.1*(incentive+upfront_mip)^2,
+                               is_summer=as.numeric(seasonality<9 & seasonality > 4)) %>%
+                        select(incentmip, cato, hpa, sato, is_summer) %>% 
+                        as.matrix,
+                      vintage=scaled_data$vintage,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+```
+
+Took a while.
+```{r}
+print(fit, pars=c("beta","vintage_beta"))
+```
+
+Ok, how do the shrunk betas look?
+
+```{r}
+betas 
+```
+
+
+
+
+How does the shrunk beta look?
+
+```{r}
+beta <- extract(fit,pars=c("beta","vintage_beta"))
+sapply(beta,dim)
+
+colnames(beta[["beta"]]) <- c("incentmip", "cato", "hpa", "sato")
+rownames(beta[["beta"]]) <- seq.int(4000)
+dimnames(beta[["vintage_beta"]])[[3]] <- colnames(beta[["beta"]])
+dimnames(beta[["vintage_beta"]])[[2]] <- min(year(scaled_data$origin)) -1 + seq.int(dim(beta[[2]][2]))
+dimnames(beta[["vintage_beta"]])[[1]] <- seq.int(4000)
+
+library(reshape2)
+beta <- bind_rows(melt(beta[["vintage_beta"]]) %>% rename(beta=Var3, vintage=Var2), 
+                 melt(beta[["beta"]]) %>% rename(beta=Var2) %>% mutate(vintage=0)) %>%
+  as_tibble()
+                
+beta %>% mutate(vintage=min(year(scaled_data$origin))-1+vintage ) %>% group_by(vintage, beta) %>% 
+  summarize(low=quantile(value,0.32),  mid=quantile(value,0.5), high=quantile(value, 0.68)) %>%
+  ggplot(aes(x=vintage)) + facet_wrap(~beta, ncol=2) + guides(fill=F,alpha=F,col=F) + 
+  geom_hline(aes(yintercept=0, col="grey")) + geom_ribbon(aes(ymin=low, ymax=high, alpha=0.6, fill="lightred")) +
+  geom_line(aes(y=mid))
+```
+
+Not ideal. Everything's negative in recent vintages. What does the intercept look like?
+```{r}
+intercept <- extract(fit, c("intercept", "vintage_intercept"))
+sapply(intercept,dim)
+
+intercept <- bind_rows(melt(intercept[["intercept"]]) %>% mutate(vintage=1985),
+              melt(intercept[["vintage_intercept"]]) %>% rename(vintage=Var2) %>% 
+                mutate(vintage=1985+vintage) %>% as_tibble())
+intercept %>% group_by(vintage) %>% 
+  summarize(low=quantile(value,0.32),  mid=quantile(value,0.5), high=quantile(value, 0.68)) %>%
+  ggplot(aes(x=vintage)) + guides(fill=F,alpha=F,col=F) +  geom_hline(aes(yintercept=0, col="grey")) +
+  geom_ribbon(aes(ymin=low, ymax=high, alpha=0.6, fill="lightred")) + geom_line(aes(y=mid))
+```
+
+What's mean CPR by vintage?
+
+```{r}
+scaled_data %>% ggplot(aes(x=vintage+1984, y=next_month_cpr, group=vintage)) + 
+  geom_boxplot() + ggtitle("CPR by Vintage")
+```
+
+Basically, there's a refinancing "sweet-spot" of around 48-120 WALA. Let's try splitting the intercept by sweet spot.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int wala_sweet_spot[N]; #Is the WALA in the 2Y to 10Y sweet spot?
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    matrix[V,K] vintage_beta;
+    real intercept;
+    real wala_intercept[2];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                wala_intercept[wala_sweet_spot[n]] +
+                (beta + vintage_beta[vintage[n]]) * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  wala_intercept[1] ~ normal(-1,5);
+  wala_intercept[2] ~ normal(1,5);
+  beta[1] ~ normal(1,5); #incentive + upfront_mip
+  beta[2] ~ normal(0,5); #cato
+  beta[3] ~ normal(1,1); #hpa
+  beta[4] ~ normal(0,1); #sato
+  to_vector(vintage_beta) ~ normal(0,1);
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+fit2 <- stan(model_code=stan_code, 
+            model_name="shrunk vintage, shrunk wala intercept",
+            data=list(N=N, K=4, V=length(unique(scaled_data$vintage)),
+                      exogs=scaled_data %>% 
+                        mutate(incentmip = (incentive+upfront_mip)-
+                               0.1*(incentive+upfront_mip)^2) %>%
+                        select(incentmip, cato, hpa, sato) %>% 
+                        as.matrix,
+                      wala_sweet_spot=1+as.numeric(scaled_data$wala <120 & scaled_data$wala > 48),
+                      vintage=scaled_data$vintage,
+                      endo=scaled_data$next_month_cpr),
+            iter=2000, chains=4, pars=c("phi"), include=FALSE)
+
+```
+
+Looks promising.
+
+```{r}
+beta <- extract(fit2,pars=c("beta","vintage_beta"))
+sapply(beta,dim)
+
+colnames(beta[["beta"]]) <- c("incentmip", "cato", "hpa", "sato")
+rownames(beta[["beta"]]) <- seq.int(4000)
+dimnames(beta[["vintage_beta"]])[[3]] <- colnames(beta[["beta"]])
+dimnames(beta[["vintage_beta"]])[[2]] <- min(year(scaled_data$origin)) -1 + seq.int(dim(beta[[2]][2]))
+dimnames(beta[["vintage_beta"]])[[1]] <- seq.int(4000)
+
+library(reshape2)
+beta <- bind_rows(melt(beta[["vintage_beta"]]) %>% rename(beta=Var3, vintage=Var2), 
+                 melt(beta[["beta"]]) %>% rename(beta=Var2) %>% mutate(vintage=0)) %>%
+  as_tibble()
+                
+beta %>% mutate(vintage=min(year(scaled_data$origin))-1+vintage ) %>% group_by(vintage, beta) %>% 
+  summarize(low=quantile(value,0.32),  mid=quantile(value,0.5), high=quantile(value, 0.68)) %>%
+  ggplot(aes(x=vintage)) + facet_wrap(~beta, ncol=2) + guides(fill=F,alpha=F,col=F) + 
+  geom_hline(aes(yintercept=0, col="grey")) + geom_ribbon(aes(ymin=low, ymax=high, alpha=0.6, fill="lightred")) +
+  geom_line(aes(y=mid))
+```
+
+```{r}
+intercept <- extract(fit2, c("intercept", "wala_intercept"))
+sapply(intercept,dim)
+
+intercept <- bind_rows(melt(intercept[["intercept"]]) %>% mutate(vintage=1985),
+              melt(intercept[["wala_intercept"]]) %>% rename(vintage=Var2) %>% 
+                mutate(vintage=1985+vintage) %>% as_tibble())
+intercept %>% group_by(vintage) %>% 
+  summarize(low=quantile(value,0.32),  mid=quantile(value,0.5), high=quantile(value, 0.68)) %>%
+  ggplot(aes(x=vintage)) + guides(fill=F,alpha=F,col=F) +  geom_hline(aes(yintercept=0, col="grey")) +
+  geom_ribbon(aes(ymin=low, ymax=high, alpha=0.6, fill="lightred")) + geom_line(aes(y=mid))
+```
+
+
+Apparently not as much difference as I thought. Axis is mislabeled. Three points are 1985: shrunk, 1986: not sweet spot, 1987: sweet spot.
+
+```{r}
+scaled_data %>% mutate(wala_sweet_spot=1+as.numeric(scaled_data$wala <120 & 
+                                                      scaled_data$wala > 48)) %>%
+  ggplot(aes(x=next_month_cpr, col=factor(wala_sweet_spot))) + geom_density()
+```
+
+Seems pretty clear to me.
+
+Let's try a poisson regression.

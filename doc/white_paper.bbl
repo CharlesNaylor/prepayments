@@ -1,0 +1,159 @@
+% $ biblatex auxiliary file $
+% $ biblatex bbl format version 2.3 $
+% Do not modify the above lines!
+%
+% This is an auxiliary file used by the 'biblatex' package.
+% This file may safely be deleted. It will be recreated by
+% biber as required.
+%
+\begingroup
+\makeatletter
+\@ifundefined{ver@biblatex.sty}
+  {\@latex@error
+     {Missing 'biblatex' package}
+     {The bibliography requires the 'biblatex' package.}
+      \aftergroup\endinput}
+  {}
+\endgroup
+
+
+\refsection{0}
+  \sortlist{entry}{nty}
+    \entry{abbott2016rate}{article}{}
+      \true{morelabelname}
+      \name{labelname}{10}{}{%
+        {{hash=85ccdcd22f5fe368fb54e6fed04d214f}{Abbott}{A\bibinitperiod}{Benjamin\bibnamedelima P}{B\bibinitperiod\bibinitdelim P\bibinitperiod}{}{}{}{}}%
+        {{hash=f8be78180236e580afcca88ecf22498d}{Abbott}{A\bibinitperiod}{R}{R\bibinitperiod}{}{}{}{}}%
+        {{hash=f7ae0f5b920293141b6fbd4a57c1ea8f}{Abbott}{A\bibinitperiod}{TD}{T\bibinitperiod}{}{}{}{}}%
+        {{hash=0c85d1631a6814a6641918d2e74d9a2d}{Abernathy}{A\bibinitperiod}{MR}{M\bibinitperiod}{}{}{}{}}%
+        {{hash=194a7071763e4f685901e59df9e140d8}{Acernese}{A\bibinitperiod}{F}{F\bibinitperiod}{}{}{}{}}%
+        {{hash=be27b094da8c3e1f0197634ca48e584f}{Ackley}{A\bibinitperiod}{K}{K\bibinitperiod}{}{}{}{}}%
+        {{hash=f769698b56a0f32b4eefe7cd9173fec6}{Adams}{A\bibinitperiod}{C}{C\bibinitperiod}{}{}{}{}}%
+        {{hash=6056be065df4502657e97920629d4676}{Adams}{A\bibinitperiod}{T}{T\bibinitperiod}{}{}{}{}}%
+        {{hash=e9bee2a656dc38a528c1775cf750c5ef}{Addesso}{A\bibinitperiod}{P}{P\bibinitperiod}{}{}{}{}}%
+        {{hash=40bf40c4b23fa533f5a09b7e8911a816}{Adhikari}{A\bibinitperiod}{RX}{R\bibinitperiod}{}{}{}{}}%
+      }
+      \true{moreauthor}
+      \name{author}{10}{}{%
+        {{hash=85ccdcd22f5fe368fb54e6fed04d214f}{Abbott}{A\bibinitperiod}{Benjamin\bibnamedelima P}{B\bibinitperiod\bibinitdelim P\bibinitperiod}{}{}{}{}}%
+        {{hash=f8be78180236e580afcca88ecf22498d}{Abbott}{A\bibinitperiod}{R}{R\bibinitperiod}{}{}{}{}}%
+        {{hash=f7ae0f5b920293141b6fbd4a57c1ea8f}{Abbott}{A\bibinitperiod}{TD}{T\bibinitperiod}{}{}{}{}}%
+        {{hash=0c85d1631a6814a6641918d2e74d9a2d}{Abernathy}{A\bibinitperiod}{MR}{M\bibinitperiod}{}{}{}{}}%
+        {{hash=194a7071763e4f685901e59df9e140d8}{Acernese}{A\bibinitperiod}{F}{F\bibinitperiod}{}{}{}{}}%
+        {{hash=be27b094da8c3e1f0197634ca48e584f}{Ackley}{A\bibinitperiod}{K}{K\bibinitperiod}{}{}{}{}}%
+        {{hash=f769698b56a0f32b4eefe7cd9173fec6}{Adams}{A\bibinitperiod}{C}{C\bibinitperiod}{}{}{}{}}%
+        {{hash=6056be065df4502657e97920629d4676}{Adams}{A\bibinitperiod}{T}{T\bibinitperiod}{}{}{}{}}%
+        {{hash=e9bee2a656dc38a528c1775cf750c5ef}{Addesso}{A\bibinitperiod}{P}{P\bibinitperiod}{}{}{}{}}%
+        {{hash=40bf40c4b23fa533f5a09b7e8911a816}{Adhikari}{A\bibinitperiod}{RX}{R\bibinitperiod}{}{}{}{}}%
+      }
+      \list{publisher}{1}{%
+        {IOP Publishing}%
+      }
+      \strng{namehash}{ae306d3516a2314e62e1902f96bec913}
+      \strng{fullhash}{98347c9d6219e11061a459e04d91e75d}
+      \field{sortinit}{A}
+      \field{labeltitle}{The rate of binary black hole mergers inferred from Advanced LIGO observations surrounding GW150914}
+      \field{journaltitle}{The Astrophysical Journal Letters}
+      \field{number}{1}
+      \field{title}{The rate of binary black hole mergers inferred from Advanced LIGO observations surrounding GW150914}
+      \field{volume}{833}
+      \field{year}{2016}
+      \field{pages}{L1}
+    \endentry
+    \entry{betancourt2017conceptual}{article}{}
+      \name{labelname}{1}{}{%
+        {{hash=1982fa604a3f94837efceaa53330b2a4}{Betancourt}{B\bibinitperiod}{Michael}{M\bibinitperiod}{}{}{}{}}%
+      }
+      \name{author}{1}{}{%
+        {{hash=1982fa604a3f94837efceaa53330b2a4}{Betancourt}{B\bibinitperiod}{Michael}{M\bibinitperiod}{}{}{}{}}%
+      }
+      \strng{namehash}{1982fa604a3f94837efceaa53330b2a4}
+      \strng{fullhash}{1982fa604a3f94837efceaa53330b2a4}
+      \field{sortinit}{B}
+      \field{labeltitle}{A Conceptual Introduction to Hamiltonian Monte Carlo}
+      \field{journaltitle}{arXiv preprint arXiv:1701.02434}
+      \field{title}{A Conceptual Introduction to Hamiltonian Monte Carlo}
+      \field{year}{2017}
+    \endentry
+    \entry{jpm_model}{article}{}
+      \name{labelname}{1}{}{%
+        {{hash=edac4d33568947e8a49a75cdf2d45ca1}{Montano}{M\bibinitperiod}{David}{D\bibinitperiod}{}{}{}{}}%
+      }
+      \name{author}{1}{}{%
+        {{hash=edac4d33568947e8a49a75cdf2d45ca1}{Montano}{M\bibinitperiod}{David}{D\bibinitperiod}{}{}{}{}}%
+      }
+      \strng{namehash}{edac4d33568947e8a49a75cdf2d45ca1}
+      \strng{fullhash}{edac4d33568947e8a49a75cdf2d45ca1}
+      \field{sortinit}{M}
+      \field{labeltitle}{The JPMorgan Prepayment Model: "It's All About Economics"}
+      \field{journaltitle}{J.P. Morgan Securities, Inc.}
+      \field{title}{The JPMorgan Prepayment Model: "It's All About Economics"}
+      \field{year}{2003}
+    \endentry
+    \entry{popova2008bayesian}{article}{}
+      \true{morelabelname}
+      \name{labelname}{3}{}{%
+        {{hash=027be0d17e90190466bee901ef07bea2}{Popova}{P\bibinitperiod}{Ivilina}{I\bibinitperiod}{}{}{}{}}%
+        {{hash=0ac3d69299e86eaef869824d09ee955d}{Popova}{P\bibinitperiod}{Elmira}{E\bibinitperiod}{}{}{}{}}%
+        {{hash=9174a7767b3206b971013dd7014dee8f}{George}{G\bibinitperiod}{Edward\bibnamedelima I}{E\bibinitperiod\bibinitdelim I\bibinitperiod}{}{}{}{}}%
+      }
+      \true{moreauthor}
+      \name{author}{3}{}{%
+        {{hash=027be0d17e90190466bee901ef07bea2}{Popova}{P\bibinitperiod}{Ivilina}{I\bibinitperiod}{}{}{}{}}%
+        {{hash=0ac3d69299e86eaef869824d09ee955d}{Popova}{P\bibinitperiod}{Elmira}{E\bibinitperiod}{}{}{}{}}%
+        {{hash=9174a7767b3206b971013dd7014dee8f}{George}{G\bibinitperiod}{Edward\bibnamedelima I}{E\bibinitperiod\bibinitdelim I\bibinitperiod}{}{}{}{}}%
+      }
+      \list{publisher}{1}{%
+        {International Society for Bayesian Analysis}%
+      }
+      \strng{namehash}{4c85a7b680656bf2b2ed4f75a19a4fcd}
+      \strng{fullhash}{a039857d5fc1c74b1e915a65fc44c2e5}
+      \field{sortinit}{P}
+      \field{labeltitle}{Bayesian forecasting of prepayment rates for individual pools of mortgages}
+      \field{journaltitle}{Bayesian Analysis}
+      \field{number}{2}
+      \field{title}{Bayesian forecasting of prepayment rates for individual pools of mortgages}
+      \field{volume}{3}
+      \field{year}{2008}
+      \field{pages}{393\bibrangedash 426}
+    \endentry
+    \entry{stan}{misc}{}
+      \name{labelname}{1}{}{%
+        {{hash=2418ee02a26ab01ead911ec86c507892}{{Stan\bibnamedelimb Development\bibnamedelimb Team}}{S\bibinitperiod}{}{}{}{}{}{}}%
+      }
+      \name{author}{1}{}{%
+        {{hash=2418ee02a26ab01ead911ec86c507892}{{Stan\bibnamedelimb Development\bibnamedelimb Team}}{S\bibinitperiod}{}{}{}{}{}{}}%
+      }
+      \strng{namehash}{2418ee02a26ab01ead911ec86c507892}
+      \strng{fullhash}{2418ee02a26ab01ead911ec86c507892}
+      \field{sortinit}{S}
+      \field{labeltitle}{Stan: A C++ Library for Probability and Sampling}
+      \field{note}{Version 2.14.0}
+      \field{title}{Stan: A C++ Library for Probability and Sampling}
+      \field{year}{2017}
+      \verb{url}
+      \verb http://mc-stan.org/
+      \endverb
+    \endentry
+    \entry{stan_manual}{book}{}
+      \name{labelname}{1}{}{%
+        {{hash=2418ee02a26ab01ead911ec86c507892}{{Stan\bibnamedelimb Development\bibnamedelimb Team}}{S\bibinitperiod}{}{}{}{}{}{}}%
+      }
+      \name{author}{1}{}{%
+        {{hash=2418ee02a26ab01ead911ec86c507892}{{Stan\bibnamedelimb Development\bibnamedelimb Team}}{S\bibinitperiod}{}{}{}{}{}{}}%
+      }
+      \strng{namehash}{2418ee02a26ab01ead911ec86c507892}
+      \strng{fullhash}{2418ee02a26ab01ead911ec86c507892}
+      \field{sortinit}{S}
+      \field{labeltitle}{{Stan} Modeling Language Users Guide and Reference Manual}
+      \field{note}{Version 2.14.0}
+      \field{title}{{Stan} Modeling Language Users Guide and Reference Manual}
+      \field{year}{2016}
+      \verb{url}
+      \verb http://mc-stan.org/
+      \endverb
+    \endentry
+  \endsortlist
+\endrefsection
+\endinput
+

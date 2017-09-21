@@ -1,0 +1,85 @@
+---
+title: "20170413 - Looking at LoanLevel data"
+output: html_notebook
+---
+
+I have 100,000 samples of similar data to the pool-level model, but at loan level. Let's have a look at it.
+
+```{r}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/loans.csv") 
+```
+
+There are 40 columns, so a regular splom is going to be difficult to interpret. Also, removal_reason is messed up. It should have come (I think), from the forward month, not from the current month. As it sits, all removal reasons are blank.
+
+In this data set, only 1.3% of samples were prepaid in the sampled month. Even looking at distributions conditioned on `prepaid` will be tricky. Let's see if density graphs look ok.
+
+```{r}
+sample_data %>% ggplot(aes(x=burnout, col=as.factor(prepaid))) + geom_density()
+```
+Let's look at continuous variables this way, then.
+
+```{r, fig.height=8, fig.width=10}
+#Start with doubles.
+cols_dbl <- sapply(spec(sample_data)$cols,function(X){TRUE %in% grepl("double", class(X))})
+cols_dbl["prepaid"] = T
+sample_data[,cols_dbl] %>% gather(beta,value,-prepaid) %>% ggplot(aes(y=value,x=factor(prepaid))) + geom_boxplot() +
+  facet_wrap(~beta, ncol=5, scales="free") 
+```
+
+Not seeing a lot of difference in these factors. Also some things are doubles when they clearly shouldn't be, e.g. `property_type` and `original_loan_term`. Let's look at the next set. 
+```{r, fig.height=8, fig.width=10}
+cols_int <- sapply(spec(sample_data)$cols,function(X){TRUE %in% grepl("integer", class(X))})
+cols_int["prepaid"] = T
+sample_data[,cols_int] %>% gather(beta,value,-prepaid) %>% ggplot(aes(y=value,x=factor(prepaid))) + geom_boxplot() +
+  facet_wrap(~beta, ncol=5, scales="free") 
+```
+
+*Nobody* with annual mortgage insurance paid off the loan? That's kind of weird.
+```{r}
+sample_data %>% filter(prepaid==1) %>% select(annual_mip) %>% max()
+```
+
+Could that be a data problem?
+
+`months_prepaid` should definitely be in there. So should `seasonality`. Steve wanted `original_principal_balance`, and there might be something there.
+
+Now, what about categorical variables? I see maturity date was reconstituted poorly. That's in the underlying data, too. Bugger.
+```{r, fig.height=8, fig.width=10}
+cols_others <- sapply(spec(sample_data)$cols,function(X){!(TRUE %in% grepl("(integer|double|date)", class(X)))})
+cols_others['prepaid'] <- T
+cols_others['pool_cusip'] <- F
+
+sample_data[,cols_others] %>% gather(beta,value,-prepaid) %>% na.omit() %>% group_by(beta, prepaid) %>%
+  do(as_tibble(table(.$value))) %>% group_by(beta, prepaid) %>% mutate(n=n/sum(n)) %>%
+  ggplot(aes(y=Var1, x=factor(prepaid), fill=n)) + geom_tile() + facet_wrap(~beta, ncol=4, scales="free") +
+  scale_fill_continuous_tableau()
+```
+
+Not much difference here. There's an argument for `refinance_type` (which is probably a rare field) , `first_time`, and `agency`. Agency could be a group.
+
+So, let's do a model with:
+
+* burnout
+* cato
+* sato
+* credit_score
+* hpa
+* incentive
+* lockin
+* months prepaid
+* first_time
+* refinance_type (if any)
+* seasonality (winter/summer)
+* total debt/expense ratio
+
+We can do partial pooling by issuer, but that's a lot of pools. Should also check vintage.

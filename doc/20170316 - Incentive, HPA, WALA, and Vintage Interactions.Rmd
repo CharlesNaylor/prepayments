@@ -1,0 +1,108 @@
+---
+title: "20170316 - Incentive, HPA, WALA, and Vintage Interactions"
+output: html_notebook
+---
+
+As noted <a href="doc/20170315 - Popova with Vintages.Rmd">yesterday</a>, when I was looking at a model with betas shrunk by pool vintage, the effects of *incentive*, *home price appreciation*, and *vintage*, or possibly *WALA*, are highly correlated in the period for which we have the greater mass of data. 
+
+So, how to incorporate these effects? We need to model interactions. In a traditional OLS paradigm, you do that by multiplying the (scaled) exogs. We can try that first. 
+
+```{r setup}
+knitr::opts_chunk$set(include = FALSE)
+library(knitr)
+opts_knit$set(root.dir = "~/src/LondonMirror/Prepayments/")
+setwd("~/src/LondonMirror/Prepayments/")
+library(tidyverse)
+library(lubridate)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+sample_data = read_csv("/data/prepayments/vnm_samples.csv") %>%
+  rename(dt=major, cusip=minor)
+
+sample_data <- sample_data %>% filter(endo >= 0 & incentive < 0.5)
+N <- nrow(sample_data)
+sample_data <- sample_data %>% mutate(endo = ((N-1) * (endo * 1e-2) + 0.5)/N,
+                                      incentive = incentive * 10, 
+                                      spline = spline * 1.3e3, 
+                                      yc = yc * 0.5,
+                                      burnout=burnout * 0.33e-2)
+
+```
+
+What does the interaction look like?
+```{r}
+sample_data %>% sample_n(size=5000) %>%
+  mutate(incenburnout=incentive - incentive*burnout) %>%
+  select(incentive,burnout,incenburnout,endo) %>%
+  ggpairs(mapping=aes(alpha=0.01))
+```
+
+Doesn't look too promising, but let's try it anyway.
+
+```{r}
+stan_code = "data {
+    int N; #Number of records
+    int K; #number of betas
+    int V; #number of vintages
+    int vintage[N]; #Pool vintage
+    matrix[N,K] exogs;
+    real endo[N];
+}
+parameters {
+    row_vector[K] beta;
+    real intercept;
+    real vintage_intercept[V];
+    real<lower=0.1> lambda; #dispersion
+}
+transformed parameters {
+    vector[N] phi; #mu
+    for(n in 1:N) {
+      phi[n] = inv_logit(intercept + 
+                        vintage_intercept[vintage[n]] +
+                        beta * exogs[n]');
+    }
+}
+model {
+  intercept ~ normal(0, 0.1);
+  to_vector(vintage_intercept) ~ normal(0, 0.1);
+  beta[1] ~ normal(1,5); #incentive * burnout
+  beta[2] ~ normal(0,5); #spline
+  beta[3] ~ normal(1,1); #yc
+  beta[4] ~ normal(1,5); #is_summer
+  lambda ~ pareto(0.1, 1.5); #as per Gelman, 2013, ch.5
+  endo ~ beta(lambda*phi, lambda*(1-phi));
+}
+generated quantities {
+  real log_lik[N];
+  real endo_hat[N];
+  for(n in 1:N) {
+    log_lik[n] = beta_lpdf(endo[n] | lambda*phi[n], lambda*(1-phi[n]));
+    endo_hat[n] = beta_rng(lambda*phi[n], lambda*(1-phi[n]));
+  }
+}
+
+"
+less_data <- sample_data %>% sample_n(size=5000) %>% 
+    mutate(vintage=year(vintage) - min(year(vintage)) + 1)
+stopifnot(all(diff(sort(unique(less_data$vintage))) == 1)) #ensure we don't have any unused parameters in the fit.
+fit <- stan(model_code=stan_code, model_name="incentiveburnout interaction, shrunk intercept",
+            data=list(N=nrow(less_data), K=4, V=length(unique(less_data$vintage)),
+                      exogs=less_data %>% 
+                        mutate(incenburnout = incentive - incentive * burnout) %>% 
+                        select(incenburnout, spline, yc, seasonality) %>%
+                            as.matrix,
+                      vintage=less_data$vintage, endo=less_data$endo),
+            iter=2000, chains=4, pars=c("phi", "shrunk_intercept"), include=FALSE)
+```
+
+Love these fast models.
+
+```{r}
+print(fit, pars=c("beta"))
+```
+
+...not what I expected to get out of this one.
+
+I have the more comprehensive (not Popova) dataset to play with now. I'll try on that one.
